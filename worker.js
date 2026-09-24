@@ -611,15 +611,28 @@ export default {
       await handleUpdate(update, env);
       return json({ok:true});
     } catch (e) {
-      // Send a safe diagnostic to the current Telegram chat when possible.
       try {
-        const update = await request.clone().json();
-        const chatId = update?.message?.chat?.id || update?.callback_query?.message?.chat?.id;
-        if (chatId) {
-          await sendMessage(env, chatId, `⚠️ Worker error:\n${String(e?.message || e).slice(0,1200)}`);
+        const adminIds = String(env.ADMIN_IDS || "")
+          .split(",")
+          .map(x => x.trim())
+          .filter(Boolean);
+    
+        const errorText =
+          `⚠️ WORKER ERROR\n\n` +
+          `${String(e?.message || e).slice(0,1200)}`;
+    
+        for (const adminId of adminIds) {
+          try {
+            await sendMessage(env, adminId, errorText);
+          } catch (_) {}
         }
       } catch (_) {}
-      return json({ok:false,error:"internal_error"},500);
+    
+      return json({
+        ok: false,
+        error: "internal_error"
+      }, 500);
     }
   }
 };
+

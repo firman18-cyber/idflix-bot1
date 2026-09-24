@@ -309,8 +309,13 @@ async function handleAdminText(msg, env) {
   if (!state) return;
 
   if (msg.video || msg.document) {
+    // Diagnostic acknowledgement: confirms Telegram reached the Worker.
+    await sendMessage(env, chatId, "📥 Video terdeteksi. Memproses...");
     const f = videoFileId(msg);
-    if (!f) return;
+    if (!f) {
+      await sendMessage(env, chatId, "⚠️ Media terdeteksi tetapi file_id tidak ditemukan.");
+      return;
+    }
     state.fileId = f.fileId;
     state.videoType = f.type;
     state.telegramDuration = f.duration;
@@ -536,7 +541,15 @@ export default {
       await handleUpdate(update, env);
       return json({ok:true});
     } catch (e) {
-      return json({ok:false,error:String(e?.message || e)},500);
+      // Send a safe diagnostic to the current Telegram chat when possible.
+      try {
+        const update = await request.clone().json();
+        const chatId = update?.message?.chat?.id || update?.callback_query?.message?.chat?.id;
+        if (chatId) {
+          await sendMessage(env, chatId, `⚠️ Worker error:\n${String(e?.message || e).slice(0,1200)}`);
+        }
+      } catch (_) {}
+      return json({ok:false,error:"internal_error"},500);
     }
   }
 };

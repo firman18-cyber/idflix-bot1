@@ -39,6 +39,27 @@ export default {
         return new Response("OK");
       }
 
+      if (text === "/idgrup" || text.startsWith("/idgrup@")) {
+        const chatType = String(message.chat?.type || "");
+        const title = String(message.chat?.title || "");
+
+        if (!["group", "supergroup"].includes(chatType)) {
+          await sendTelegram(
+            env.BOT_TOKEN,
+            chatId,
+            "ℹ️ Perintah /idgrup harus dikirim di dalam grup Telegram."
+          );
+          return new Response("OK");
+        }
+
+        await sendTelegram(
+          env.BOT_TOKEN,
+          chatId,
+          `🆔 Chat ID grup: ${chatId}\n📌 Nama grup: ${title || "(tanpa nama)"}`
+        );
+        return new Response("OK");
+      }
+
       if (text === "/start" || text.startsWith("/start@")) {
         await sendTelegram(
           env.BOT_TOKEN,

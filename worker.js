@@ -520,11 +520,81 @@ async function proxyTelegramFile(request, env) {
   return new Response(upstream.body, {status:upstream.status, headers});
 }
 
+async function diagnostic(env) {
+  const result = {
+    ok: true,
+    service: "idflix-bot1",
+    checkedAt: new Date().toISOString(),
+
+    config: {
+      BOT_TOKEN: !!env.BOT_TOKEN,
+      ADMIN_IDS: !!env.ADMIN_IDS,
+      IDFLIX_GROUP_ID: !!env.IDFLIX_GROUP_ID,
+      TOPIC_KV: !!env.TOPIC_KV,
+      FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
+      FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY
+    },
+
+    webhook: null
+  };
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${env.BOT_TOKEN}/getWebhookInfo`
+    );
+
+    const data = await response.json();
+
+    if (!data.ok) {
+      result.ok = false;
+
+      result.webhook = {
+        ok: false,
+        telegramError: data.description || "Telegram API error"
+      };
+
+      return result;
+    }
+
+    const w = data.result || {};
+
+    result.webhook = {
+      ok: true,
+      url: w.url || "",
+      pending_update_count: Number(w.pending_update_count || 0),
+      max_connections: w.max_connections ?? null,
+      ip_address: w.ip_address || null,
+      allowed_updates: Array.isArray(w.allowed_updates)
+        ? w.allowed_updates
+        : null,
+      last_error_date: w.last_error_date
+        ? new Date(w.last_error_date * 1000).toISOString()
+        : null,
+      last_error_message: w.last_error_message || null
+    };
+
+  } catch (e) {
+    result.ok = false;
+
+    result.webhook = {
+      ok: false,
+      error: String(e?.message || e).slice(0, 500)
+    };
+  }
+
+  return result;
+}
+
 export default {
   async fetch(request, env) {
     if (!env.BOT_TOKEN) return json({ok:false,error:"BOT_TOKEN belum diatur"},500);
 
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/diagnostic") {
+    return json(await diagnostic(env));
+    }
+
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("IDFLIX Telegram Bot Worker aktif.", {
         headers: {"content-type":"text/plain; charset=utf-8"}

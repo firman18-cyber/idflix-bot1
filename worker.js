@@ -22,19 +22,19 @@ async function tg(env, method, body) {
     body: JSON.stringify(body)
   });
   const data = await r.json();
-  if (!if (!data.ok) {
-  const description = String(data.description || "");
-
-  if (
-    method === "editMessageText" &&
-    description.includes("message is not modified")
-  ) {
-    return data.result || true;
-  }
-
-  throw new Error(
-    `Telegram ${method}: ${description || "unknown error"}`
-  );
+    if (!data.ok) {
+      const description = String(data.description || "");
+    
+      if (
+        method === "editMessageText" &&
+        description.includes("message is not modified")
+      ) {
+        return data.result || true;
+      }
+    
+      throw new Error(
+        `Telegram ${method}: ${description || "unknown error"}`
+      );
 }
 
 return data.result;

@@ -50,47 +50,48 @@ function b64urlText(s) {
 function pemToDer(pem) {
   let value = String(pem || "").trim();
 
-  // Jika Secret tersimpan sebagai string JSON dengan tanda kutip,
-  // lepaskan tanda kutip pembungkusnya.
-  if (
-    value.length >= 2 &&
-    value.startsWith('"') &&
-    value.endsWith('"')
-  ) {
-    value = value.slice(1, -1);
+  // Jika Secret tersimpan sebagai string JSON dengan tanda kutip
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      value = JSON.parse(value);
+    } catch (_) {
+      value = value.slice(1, -1);
+    }
   }
 
-  // Normalisasi literal "\n" menjadi newline asli.
-  value = value.replace(/\\r?\\n/g, "\n");
+  // Ubah literal \n menjadi newline asli
+  value = value.replace(/\\r\\n/g, "\n");
+  value = value.replace(/\\n/g, "\n");
+  value = value.replace(/\r/g, "");
 
-  // Hilangkan header/footer PEM.
-  value = value
-    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-    .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
-    .replace(/-----END RSA PRIVATE KEY-----/g, "");
+  // Ambil isi di antara header/footer PEM
+  const match = value.match(
+    /-----BEGIN PRIVATE KEY-----([\s\S]*?)-----END PRIVATE KEY-----/
+  );
 
-  // Hilangkan whitespace.
-  const b64 = value.replace(/\s/g, "");
+  if (!match) {
+    throw new Error(
+      "FIREBASE_PRIVATE_KEY tidak memiliki format -----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----."
+    );
+  }
+
+  const b64 = match[1].replace(/\s/g, "");
 
   if (!b64) {
-    throw new Error("FIREBASE_PRIVATE_KEY kosong.");
+    throw new Error("Isi FIREBASE_PRIVATE_KEY kosong.");
   }
 
-  // Validasi karakter Base64 sebelum atob().
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+  // Decode Base64 tanpa validasi regex yang terlalu ketat
+  let bin;
+
+  try {
+    bin = atob(b64);
+  } catch (_) {
     throw new Error(
-      "FIREBASE_PRIVATE_KEY bukan Base64/PEM yang valid. Periksa Secret FIREBASE_PRIVATE_KEY."
+      "Isi FIREBASE_PRIVATE_KEY gagal di-decode sebagai Base64. Pastikan private_key berasal dari Firebase Service Account JSON."
     );
   }
 
-  if (b64.length % 4 !== 0) {
-    throw new Error(
-      "FIREBASE_PRIVATE_KEY memiliki panjang Base64 yang tidak valid."
-    );
-  }
-
-  const bin = atob(b64);
   const out = new Uint8Array(bin.length);
 
   for (let i = 0; i < bin.length; i++) {
@@ -99,7 +100,6 @@ function pemToDer(pem) {
 
   return out;
 }
-
 let tokenCache = {token:"", exp:0};
 
 async function googleAccessToken(env) {

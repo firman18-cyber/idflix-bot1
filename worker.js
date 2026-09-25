@@ -551,81 +551,92 @@ async function proxyTelegramFile(request, env) {
   const url = new URL(request.url);
   const prefix = "/file/";
   const fileId = decodeURIComponent(url.pathname.slice(prefix.length));
-  if (!fileId) return new Response("Missing file_id", {status:400});
 
-  const meta = await tg(env, "getFile", {file_id:fileId});
-  const filePath = meta.file_path;
-  const upstream = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`, {
-    headers: request.headers.get("range") ? {range:request.headers.get("range")} : {}
-  });
-  const headers = new Headers(upstream.headers);
-  headers.set("cache-control","public, max-age=3600");
-  return new Response(upstream.body, {status:upstream.status, headers});
-}
-
-async function diagnostic(env) {
-  const result = {
-    ok: true,
-    service: "idflix-bot1",
-    checkedAt: new Date().toISOString(),
-
-    config: {
-      BOT_TOKEN: !!env.BOT_TOKEN,
-      ADMIN_IDS: !!env.ADMIN_IDS,
-      IDFLIX_GROUP_ID: !!env.IDFLIX_GROUP_ID,
-      TOPIC_KV: !!env.TOPIC_KV,
-      FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
-      FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY
-    },
-
-    webhook: null
-  };
-
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${env.BOT_TOKEN}/getWebhookInfo`
-    );
-
-    const data = await response.json();
-
-    if (!data.ok) {
-      result.ok = false;
-
-      result.webhook = {
-        ok: false,
-        telegramError: data.description || "Telegram API error"
-      };
-
-      return result;
-    }
-
-    const w = data.result || {};
-
-    result.webhook = {
-      ok: true,
-      url: w.url || "",
-      pending_update_count: Number(w.pending_update_count || 0),
-      max_connections: w.max_connections ?? null,
-      ip_address: w.ip_address || null,
-      allowed_updates: Array.isArray(w.allowed_updates)
-        ? w.allowed_updates
-        : null,
-      last_error_date: w.last_error_date
-        ? new Date(w.last_error_date * 1000).toISOString()
-        : null,
-      last_error_message: w.last_error_message || null
-    };
-
-  } catch (e) {
-    result.ok = false;
-
-    result.webhook = {
-      ok: false,
-      error: String(e?.message || e).slice(0, 500)
-    };
+  if (!fileId) {
+    return new Response("Missing file_id", { status: 400 });
   }
 
-  return result;
+  // Ambil informasi file dari Telegram
+  const meta = await tg(env, "getFile", {
+    file_id: fileId
+  });
+
+  if (!meta?.file_path) {
+    return new Response("Telegram file_path tidak tersedia", {
+      status: 502
+    });
+  }
+
+  const range = request.headers.get("Range");
+
+  const upstreamHeaders = new Headers();
+
+  if (range) {
+    upstreamHeaders.set("Range", range);
+  }
+
+  // Ambil file dari Telegram
+  const upstream = await fetch(
+    `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${meta.file_path}`,
+    {
+      headers: upstreamHeaders
+    }
+  );
+
+  if (!upstream.ok && upstream.status !== 206) {
+    const text = await upstream.text().catch(() => "");
+    
+    return new Response(
+      `Telegram file error: ${upstream.status} ${text.slice(0, 500)}`,
+      {
+        status: 502,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          "access-control-allow-origin": "*"
+        }
+      }
+    );
+  }
+
+  const headers = new Headers();
+
+  // CORS
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Range");
+  headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+
+  // Video streaming
+  headers.set(
+    "Content-Type",
+    upstream.headers.get("Content-Type") || "video/mp4"
+  );
+
+  headers.set(
+    "Accept-Ranges",
+    upstream.headers.get("Accept-Ranges") || "bytes"
+  );
+
+  const contentLength = upstream.headers.get("Content-Length");
+  const contentRange = upstream.headers.get("Content-Range");
+
+  if (contentLength) {
+    headers.set("Content-Length", contentLength);
+  }
+
+  if (contentRange) {
+    headers.set("Content-Range", contentRange);
+  }
+
+  headers.set(
+    "Cache-Control",
+    "public, max-age=3600"
+  );
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers
+  });
 }
 
 export default {
@@ -633,6 +644,18 @@ export default {
     if (!env.BOT_TOKEN) return json({ok:false,error:"BOT_TOKEN belum diatur"},500);
 
     const url = new URL(request.url);
+    
+    if (request.method === "OPTIONS") {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "Range",
+      "Access-Control-Max-Age": "86400"
+    }
+  });
+}
 
     if (request.method === "GET" && url.pathname === "/diagnostic") {
     return json(await diagnostic(env));

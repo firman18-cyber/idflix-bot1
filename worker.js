@@ -48,12 +48,55 @@ function b64urlText(s) {
   return b64urlBytes(new TextEncoder().encode(s));
 }
 function pemToDer(pem) {
-  const b64 = pem.replace(/-----BEGIN PRIVATE KEY-----/g,"")
-    .replace(/-----END PRIVATE KEY-----/g,"")
-    .replace(/\s/g,"");
+  let value = String(pem || "").trim();
+
+  // Jika Secret tersimpan sebagai string JSON dengan tanda kutip,
+  // lepaskan tanda kutip pembungkusnya.
+  if (
+    value.length >= 2 &&
+    value.startsWith('"') &&
+    value.endsWith('"')
+  ) {
+    value = value.slice(1, -1);
+  }
+
+  // Normalisasi literal "\n" menjadi newline asli.
+  value = value.replace(/\\r?\\n/g, "\n");
+
+  // Hilangkan header/footer PEM.
+  value = value
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
+    .replace(/-----END RSA PRIVATE KEY-----/g, "");
+
+  // Hilangkan whitespace.
+  const b64 = value.replace(/\s/g, "");
+
+  if (!b64) {
+    throw new Error("FIREBASE_PRIVATE_KEY kosong.");
+  }
+
+  // Validasi karakter Base64 sebelum atob().
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+    throw new Error(
+      "FIREBASE_PRIVATE_KEY bukan Base64/PEM yang valid. Periksa Secret FIREBASE_PRIVATE_KEY."
+    );
+  }
+
+  if (b64.length % 4 !== 0) {
+    throw new Error(
+      "FIREBASE_PRIVATE_KEY memiliki panjang Base64 yang tidak valid."
+    );
+  }
+
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+
   return out;
 }
 
@@ -76,8 +119,8 @@ async function googleAccessToken(env) {
   };
   const unsigned = `${b64urlText(JSON.stringify(header))}.${b64urlText(JSON.stringify(claim))}`;
   const key = await crypto.subtle.importKey(
-    "pkcs8",
-    pemToDer(env.FIREBASE_PRIVATE_KEY.replace(/\\n/g,"\n")),
+  "pkcs8",
+  pemToDer(env.FIREBASE_PRIVATE_KEY),
     {name:"RSASSA-PKCS1-v1_5", hash:"SHA-256"},
     false,
     ["sign"]

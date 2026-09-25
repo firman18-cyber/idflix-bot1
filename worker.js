@@ -22,22 +22,9 @@ async function tg(env, method, body) {
     body: JSON.stringify(body)
   });
   const data = await r.json();
-    if (!data.ok) {
-      const description = String(data.description || "");
-    
-      if (
-        method === "editMessageText" &&
-        description.includes("message is not modified")
-      ) {
-        return data.result || true;
-      }
-    
-      throw new Error(
-        `Telegram ${method}: ${description || "unknown error"}`
-      );
+  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || "unknown error"}`);
+  return data.result;
 }
-
-return data.result;
 
 async function sendMessage(env, chatId, text, extra = {}) {
   return tg(env, "sendMessage", {chat_id: chatId, text, ...extra});
@@ -714,4 +701,3 @@ export default {
     }
   }
 };
-

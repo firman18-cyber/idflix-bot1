@@ -15,6 +15,9 @@ function isAdmin(from, env) {
   return ids.includes(String(from?.id || ""));
 }
 
+// Error Telegram yang tidak fatal dan tidak boleh menggagalkan Worker.
+const NON_FATAL_TG_ERROR = /message is not modified|query is too old|response timeout expired|query id is invalid/i;
+
 async function tg(env, method, body) {
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
@@ -22,7 +25,14 @@ async function tg(env, method, body) {
     body: JSON.stringify(body)
   });
   const data = await r.json();
-  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || "unknown error"}`);
+  if (!data.ok) {
+    const desc = String(data.description || "unknown error");
+    if (NON_FATAL_TG_ERROR.test(desc)) {
+      // Non-fatal: jangan lempar error, biarkan alur tetap berjalan.
+      return null;
+    }
+    throw new Error(`Telegram ${method}: ${desc}`);
+  }
   return data.result;
 }
 
@@ -188,21 +198,53 @@ async function uniqueMovieId(env, title) {
   return exists ? `${base}-${Date.now().toString(36)}` : base;
 }
 
-function stateKey(userId) { return `state:${userId}`; }
-async function getState(env, userId) {
-  return env.TOPIC_KV ? await env.TOPIC_KV.get(stateKey(userId), "json") : null;
-}
-async function putState(env, userId, state) {
-  if (env.TOPIC_KV) await env.TOPIC_KV.put(stateKey(userId), JSON.stringify(state), {expirationTtl: 86400});
-}
-async function delState(env, userId) {
-  if (env.TOPIC_KV) await env.TOPIC_KV.delete(stateKey(userId));
+// ---- TOPIC_KV helpers -------------------------------------------------
+// Semua state (percakapan admin, poster sementara, draft, topic genre)
+// disimpan di binding KV bernama TOPIC_KV. Jika binding tidak terhubung,
+// lempar error yang jelas alih-alih gagal diam-diam.
+function requireKV(env) {
+  if (!env.TOPIC_KV) {
+    throw new Error("TOPIC_KV belum terhubung. Periksa binding KV di wrangler.jsonc.");
+  }
 }
 
-function videoFileId(msg) {
-  if (msg?.video?.file_id) return {type:"video", fileId:msg.video.file_id, duration:msg.video.duration || 0};
-  if (msg?.document?.file_id) return {type:"document", fileId:msg.document.file_id, duration:0};
-  return null;
+function stateKey(userId) { return `state:${userId}`; }
+async function getState(env, userId) {
+  requireKV(env);
+  return await env.TOPIC_KV.get(stateKey(userId), "json");
+}
+async function putState(env, userId, state) {
+  requireKV(env);
+  await env.TOPIC_KV.put(stateKey(userId), JSON.stringify(state), {expirationTtl: 86400});
+}
+async function delState(env, userId) {
+  requireKV(env);
+  await env.TOPIC_KV.delete(stateKey(userId));
+}
+
+// Poster sementara: file_id poster terakhir yang diupload tiap admin,
+// menunggu dipakai oleh /simpan <judul>.
+function posterKey(userId) { return `poster:${userId}`; }
+async function putLastPoster(env, userId, fileId) {
+  requireKV(env);
+  await env.TOPIC_KV.put(posterKey(userId), fileId, {expirationTtl: 21600}); // 6 jam
+}
+async function getLastPoster(env, userId) {
+  requireKV(env);
+  return await env.TOPIC_KV.get(posterKey(userId));
+}
+
+// ---- Validasi URL video (generic, tidak dikunci ke provider tertentu) --
+function isValidVideoUrl(text) {
+  const s = String(text || "").trim();
+  if (!s) return false;
+  if (!s.startsWith("https://")) return false;
+  try {
+    const u = new URL(s);
+    return u.protocol === "https:" && !!u.hostname;
+  } catch {
+    return false;
+  }
 }
 
 function qualityKeyboard(selected = "") {
@@ -238,6 +280,13 @@ function confirmKeyboard() {
   ]};
 }
 
+function addQualityKeyboard() {
+  return {inline_keyboard:[
+    [{text:"✅ SIMPAN", callback_data:"confirm_add"}],
+    [{text:"❌ Batal", callback_data:"cancel"}]
+  ]};
+}
+
 function formatSummary(s) {
   return `🎬 KONFIRMASI FILM
 
@@ -249,14 +298,14 @@ Rating: ${s.rating || "-"}
 Durasi: ${s.duration || "-"}
 Deskripsi: ${s.description || "-"}
 
-Video: ${s.videoType || "video"}
-Media tetap tersimpan di Telegram.`;
+🔗 Video URL: ${s.videoUrl}
+🖼️ Poster: ${s.posterFileId ? "tersimpan (dari Telegram)" : "-"}`;
 }
 
 async function askNext(env, state, chatId) {
   if (state.mode === "simpan") {
-    if (!state.fileId) {
-      await sendMessage(env, chatId, "📹 Silakan kirim/reply video yang akan disimpan.");
+    if (!state.videoUrl) {
+      await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
       return;
     }
     if (!state.quality) {
@@ -287,8 +336,8 @@ async function askNext(env, state, chatId) {
     }
     await sendMessage(env, chatId, formatSummary(state), {reply_markup:confirmKeyboard()});
   } else if (state.mode === "tambah") {
-    if (!state.fileId) {
-      await sendMessage(env, chatId, "📹 Silakan kirim/reply video kualitas tambahan.");
+    if (!state.videoUrl) {
+      await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
       return;
     }
     if (!state.quality) {
@@ -296,11 +345,8 @@ async function askNext(env, state, chatId) {
       return;
     }
     await sendMessage(env, chatId,
-      `🎬 ${state.title}\n\nKualitas: ${state.quality}\n\nKlik SIMPAN untuk menambahkan kualitas ini.`,
-      {reply_markup:{inline_keyboard:[
-        [{text:"✅ SIMPAN",callback_data:"confirm_add"}],
-        [{text:"❌ Batal",callback_data:"cancel"}]
-      ]}});
+      `🎬 ${state.title}\n\nKualitas: ${state.quality}\n🔗 URL: ${state.videoUrl}\n\nKlik SIMPAN untuk menambahkan kualitas ini.`,
+      {reply_markup:addQualityKeyboard()});
   }
 }
 
@@ -309,13 +355,26 @@ async function handleAdminText(msg, env) {
   const chatId = msg.chat.id;
   const text = String(msg.text || "").trim();
 
+  // Poster diupload kapan saja (biasanya sebelum /simpan). Selalu simpan
+  // sebagai "poster terakhir" milik admin tersebut.
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const largest = msg.photo[msg.photo.length - 1];
+    await putLastPoster(env, userId, largest.file_id);
+    await sendMessage(env, chatId, "🖼️ Poster diterima dan disimpan sementara.\n\nGunakan /simpan <judul> untuk melanjutkan.");
+    return;
+  }
+
   if (text === "/id") {
     await sendMessage(env, chatId, `Telegram ID kamu: ${msg.from.id}`);
     return;
   }
   if (text === "/start") {
     await sendMessage(env, chatId,
-      "IDFLIX Bot aktif.\n\n/simpan <judul> — tambah film baru\n/tambah <judul> — tambah kualitas ke film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
+      "IDFLIX Bot aktif.\n\n" +
+      "1. Upload poster film (gambar)\n" +
+      "2. /simpan <judul> — tambah film baru\n" +
+      "3. /tambah <judul> — tambah kualitas video ke film yang sudah ada\n\n" +
+      "/list — daftar film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
     return;
   }
   if (text === "/ping") {
@@ -328,12 +387,35 @@ async function handleAdminText(msg, env) {
     return;
   }
 
+  if (text === "/list") {
+    const movies = await firebaseRequest(env, "GET", "movies") || {};
+    const entries = Object.entries(movies);
+    if (!entries.length) {
+      await sendMessage(env, chatId, "📭 Belum ada film di database.");
+      return;
+    }
+    entries.sort((a,b) => (Number(b[1]?.addedAt)||0) - (Number(a[1]?.addedAt)||0));
+    const top = entries.slice(0, 20);
+    const lines = top.map(([id, m]) => {
+      const qualities = m.videos ? Object.keys(m.videos).join(", ") : (m.quality || "-");
+      return `• ${m.title || id} (${id})\n  Tahun: ${m.year || "-"} | Kualitas: ${qualities || "-"}`;
+    });
+    const extra = entries.length > 20 ? `\n\n...dan ${entries.length - 20} film lainnya.` : "";
+    await sendMessage(env, chatId, `📚 DAFTAR FILM (${entries.length})\n\n${lines.join("\n\n")}${extra}`);
+    return;
+  }
+
   if (text.startsWith("/simpan ")) {
     const title = text.slice(8).trim();
     if (!title) return sendMessage(env, chatId, "Format: /simpan <judul>");
-    const state = {userId, mode:"simpan", title, createdAt:Date.now(), chatId};
+    const posterFileId = await getLastPoster(env, userId);
+    if (!posterFileId) {
+      await sendMessage(env, chatId, "⚠️ Kirim poster film terlebih dahulu (upload gambar), lalu jalankan /simpan <judul> lagi.");
+      return;
+    }
+    const state = {userId, mode:"simpan", title, posterFileId, createdAt:Date.now(), chatId};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Judul: ${title}\n\nSekarang kirim/reply video film tersebut.`);
+    await sendMessage(env, chatId, `🎬 Judul: ${title}\n🖼️ Poster: tersimpan\n\n🔗 Kirim link video Dosya.at atau hosting lain (harus diawali https://)`);
     return;
   }
 
@@ -344,32 +426,32 @@ async function handleAdminText(msg, env) {
     if (!found) return sendMessage(env, chatId, `❌ Film "${title}" belum ditemukan di Firebase.`);
     const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Film ditemukan: ${found.movie.title}\n\nKirim/reply video kualitas tambahan.`);
+    await sendMessage(env, chatId, `🎬 Film ditemukan: ${found.movie.title}\n\n🔗 Kirim link video kualitas tambahan (harus diawali https://)`);
     return;
   }
 
   const state = await getState(env, userId);
   if (!state) return;
 
-  if (msg.video || msg.document) {
-    // Diagnostic acknowledgement: confirms Telegram reached the Worker.
-    await sendMessage(env, chatId, "📥 Video terdeteksi. Memproses...");
-    const f = videoFileId(msg);
-    if (!f) {
-      await sendMessage(env, chatId, "⚠️ Media terdeteksi tetapi file_id tidak ditemukan.");
+  if (!text) return; // abaikan pesan non-teks lain di luar flow yang dikenal
+
+  if ((state.mode === "simpan" || state.mode === "tambah") && !state.videoUrl) {
+    if (!isValidVideoUrl(text)) {
+      await sendMessage(env, chatId, "❌ URL tidak valid. URL harus diawali https:// dan berupa link yang valid.\n\n🔗 Kirim link video.");
       return;
     }
-    state.fileId = f.fileId;
-    state.videoType = f.type;
-    state.telegramDuration = f.duration;
+    state.videoUrl = text;
     await putState(env, userId, state);
     await askNext(env, state, chatId);
     return;
   }
 
-  if (state.mode === "simpan" && !state.quality && state.fileId) {
-    // Quality is selected with callback; fall through.
-  } else if (state.mode === "simpan") {
+  if (state.mode === "simpan" && state.videoUrl && !state.quality) {
+    // Kualitas dipilih lewat callback keyboard; abaikan teks di sini.
+    return;
+  }
+
+  if (state.mode === "simpan" && state.quality) {
     if (!state.year) {
       if (!/^\d{4}$/.test(text)) return sendMessage(env, chatId, "❌ Tahun harus 4 digit, contoh: 2026.");
       state.year = Number(text);
@@ -407,7 +489,17 @@ async function handleCallback(q, env) {
   }
 
   if (data.startsWith("q:")) {
-    state.quality = data.slice(2);
+    const chosen = data.slice(2);
+
+    if (state.mode === "tambah" && state.movieId) {
+      const movie = await getMovie(env, state.movieId);
+      if (movie?.videos?.[chosen]) {
+        await answerCallback(env, q.id, `Kualitas ${chosen} sudah ada. Pilih kualitas lain.`);
+        return;
+      }
+    }
+
+    state.quality = chosen;
     await putState(env, userId, state);
     await answerCallback(env, q.id, `Kualitas ${state.quality}`);
     await editMessage(env, chatId, msg.message_id, `🎞️ Kualitas dipilih: ${state.quality}\n\nKlik Lanjut.`, {reply_markup:qualityKeyboard(state.quality)});
@@ -443,7 +535,8 @@ async function handleCallback(q, env) {
   }
 
   if (data === "draft_save") {
-    await env.TOPIC_KV?.put(`draft:${userId}`, JSON.stringify(state), {expirationTtl: 604800});
+    requireKV(env);
+    await env.TOPIC_KV.put(`draft:${userId}`, JSON.stringify(state), {expirationTtl: 604800});
     await delState(env, userId);
     await answerCallback(env, q.id, "Draft disimpan 7 hari.");
     await editMessage(env, chatId, msg.message_id, "💾 Draft disimpan.\n\nMulai lagi dengan /simpan <judul>.");
@@ -451,25 +544,28 @@ async function handleCallback(q, env) {
   }
 
   if (data === "confirm_save") {
-    if (!state.fileId || !state.quality || !state.year || !state.genre?.length || state.rating === undefined || !state.duration || !state.description) {
+    if (!state.videoUrl || !state.quality || !state.year || !state.genre?.length || state.rating === undefined || !state.duration || !state.description) {
       return answerCallback(env, q.id, "Data belum lengkap.");
     }
     await answerCallback(env, q.id, "Menyimpan film...");
     const id = await uniqueMovieId(env, state.title);
-    const fileUrl = `${new URL("https://idflix-bot1.firman-uke29.workers.dev").origin}/file/${encodeURIComponent(state.fileId)}`;
     const movie = {
+      type: "movie",
       title: state.title,
       year: state.year,
       genre: state.genre,
-      duration: state.duration,
       rating: Number(state.rating),
+      duration: state.duration,
       description: state.description,
-      addedAt: Date.now(),
-      videos: {[state.quality]: {videoUrl:fileUrl, telegramFileId:state.fileId}},
-      videoUrl: fileUrl
+      posterFileId: state.posterFileId || "",
+      backdrop: "",
+      videos: {[state.quality]: {videoUrl: state.videoUrl, provider: "custom"}},
+      videoUrl: state.videoUrl,
+      quality: state.quality,
+      addedAt: Date.now()
     };
     await firebaseRequest(env, "PUT", `movies/${id}`, movie);
-    await delState(env);
+    await delState(env, userId);
 
     const lines = [];
     if (env.IDFLIX_GROUP_ID && env.TOPIC_KV) {
@@ -482,8 +578,8 @@ async function handleCallback(q, env) {
               chat_id:env.IDFLIX_GROUP_ID,
               name:genre
             });
-            threadId = String(topic.message_thread_id);
-            await env.TOPIC_KV.put(key, threadId);
+            threadId = topic ? String(topic.message_thread_id) : null;
+            if (threadId) await env.TOPIC_KV.put(key, threadId);
           } catch (e) {
             // Keep movie save successful even if topic creation fails.
           }
@@ -492,7 +588,7 @@ async function handleCallback(q, env) {
       }
     }
     await sendMessage(env, chatId,
-      `✅ FILM BERHASIL DISIMPAN\n\n🎬 Judul: ${state.title}\n🆔 ID: ${id}\n🎞️ Kualitas: ${state.quality}\n📂 Genre: ${state.genre.join(", ")}\n\n☁️ Media tetap tersimpan di Telegram.`);
+      `✅ FILM BERHASIL DISIMPAN\n\n🎬 Judul: ${state.title}\n🆔 ID: ${id}\n🎞️ Kualitas: ${state.quality}\n📂 Genre: ${state.genre.join(", ")}\n🔗 Video: ${state.videoUrl}\n🖼️ Poster: tersimpan di Telegram (posterFileId)`);
 
     if (env.IDFLIX_GROUP_ID) {
       for (const genre of state.genre) {
@@ -510,17 +606,23 @@ async function handleCallback(q, env) {
   }
 
   if (data === "confirm_add") {
-    if (!state.movieId || !state.fileId || !state.quality) return answerCallback(env, q.id, "Data belum lengkap.");
+    if (!state.movieId || !state.videoUrl || !state.quality) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
-    if (movie.videos?.[state.quality]) return answerCallback(env, q.id, "Kualitas itu sudah ada.");
-    const fileUrl = `${new URL("https://idflix-bot1.firman-uke29.workers.dev").origin}/file/${encodeURIComponent(state.fileId)}`;
+    if (movie.videos?.[state.quality]) {
+      await answerCallback(env, q.id, "Kualitas itu sudah ada.");
+      await editMessage(env, chatId, msg.message_id, `⚠️ Kualitas ${state.quality} sudah ada untuk film ini. Data lama tidak ditimpa.`);
+      await delState(env, userId);
+      return;
+    }
     const videos = {...(movie.videos || {})};
-    videos[state.quality] = {videoUrl:fileUrl, telegramFileId:state.fileId};
-    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, {videos, videoUrl:movie.videoUrl || fileUrl});
-    await delState(env);
+    videos[state.quality] = {videoUrl: state.videoUrl, provider: "custom"};
+    const patch = {videos};
+    if (!movie.videoUrl) patch.videoUrl = state.videoUrl; // hanya isi jika film lama belum punya videoUrl utama
+    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
+    await delState(env, userId);
     await answerCallback(env, q.id, "Kualitas berhasil ditambahkan.");
-    await editMessage(env, chatId, msg.message_id, `✅ Kualitas ${state.quality} berhasil ditambahkan ke ${movie.title}.`);
+    await editMessage(env, chatId, msg.message_id, `✅ Kualitas ${state.quality} berhasil ditambahkan ke ${movie.title}.\n🔗 ${state.videoUrl}`);
     return;
   }
 }
@@ -547,9 +649,9 @@ async function handleUpdate(update, env) {
   await handleAdminText(msg, env);
 }
 
-async function proxyTelegramFile(request, env) {
+// ---- Proxy media Telegram (video lama & poster) ------------------------
+async function proxyTelegramMedia(request, env, prefix, defaultContentType, cacheControl) {
   const url = new URL(request.url);
-  const prefix = "/file/";
   const fileId = decodeURIComponent(url.pathname.slice(prefix.length));
 
   if (!fileId) {
@@ -585,7 +687,7 @@ async function proxyTelegramFile(request, env) {
 
   if (!upstream.ok && upstream.status !== 206) {
     const text = await upstream.text().catch(() => "");
-    
+
     return new Response(
       `Telegram file error: ${upstream.status} ${text.slice(0, 500)}`,
       {
@@ -606,10 +708,9 @@ async function proxyTelegramFile(request, env) {
   headers.set("Access-Control-Allow-Headers", "Range");
   headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
 
-  // Video streaming
   headers.set(
     "Content-Type",
-    upstream.headers.get("Content-Type") || "video/mp4"
+    upstream.headers.get("Content-Type") || defaultContentType
   );
 
   headers.set(
@@ -628,10 +729,7 @@ async function proxyTelegramFile(request, env) {
     headers.set("Content-Range", contentRange);
   }
 
-  headers.set(
-    "Cache-Control",
-    "public, max-age=3600"
-  );
+  headers.set("Cache-Control", cacheControl);
 
   return new Response(upstream.body, {
     status: upstream.status,
@@ -639,27 +737,61 @@ async function proxyTelegramFile(request, env) {
   });
 }
 
-export default {
-  async fetch(request, env) {
-    if (!env.BOT_TOKEN) return json({ok:false,error:"BOT_TOKEN belum diatur"},500);
-
-    const url = new URL(request.url);
-    
-    if (request.method === "OPTIONS") {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-      "Access-Control-Allow-Headers": "Range",
-      "Access-Control-Max-Age": "86400"
-    }
-  });
+// Kompatibilitas film lama yang masih menyimpan video di Telegram.
+async function proxyTelegramFile(request, env) {
+  return proxyTelegramMedia(request, env, "/file/", "video/mp4", "public, max-age=3600");
 }
 
-    if (request.method === "GET" && url.pathname === "/diagnostic") {
-    return json(await diagnostic(env));
+// Poster film (baru maupun lama) selalu diambil dari Telegram lewat endpoint ini.
+async function proxyTelegramPoster(request, env) {
+  return proxyTelegramMedia(request, env, "/poster/", "image/jpeg", "public, max-age=86400");
+}
+
+async function diagnostic(env) {
+  const envInfo = {
+    BOT_TOKEN: !!env.BOT_TOKEN,
+    ADMIN_IDS: !!env.ADMIN_IDS,
+    IDFLIX_GROUP_ID: !!env.IDFLIX_GROUP_ID,
+    TOPIC_KV: !!env.TOPIC_KV,
+    FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
+    FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY
+  };
+
+  let webhook;
+  if (env.BOT_TOKEN) {
+    try {
+      webhook = await tg(env, "getWebhookInfo", {});
+    } catch (e) {
+      webhook = {error: String(e?.message || e)};
     }
+  } else {
+    webhook = {error: "BOT_TOKEN belum diatur, tidak bisa mengambil webhook info."};
+  }
+
+  return {ok:true, env: envInfo, webhook};
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers": "Range",
+          "Access-Control-Max-Age": "86400"
+        }
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/diagnostic") {
+      return json(await diagnostic(env));
+    }
+
+    if (!env.BOT_TOKEN) return json({ok:false,error:"BOT_TOKEN belum diatur"},500);
 
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("IDFLIX Telegram Bot Worker aktif.", {
@@ -668,6 +800,10 @@ export default {
     }
     if (request.method === "GET" && url.pathname.startsWith("/file/")) {
       try { return await proxyTelegramFile(request, env); }
+      catch (e) { return new Response(String(e.message || e), {status:502}); }
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/poster/")) {
+      try { return await proxyTelegramPoster(request, env); }
       catch (e) { return new Response(String(e.message || e), {status:502}); }
     }
     if (request.method !== "POST") return new Response("Method Not Allowed",{status:405});
@@ -682,18 +818,18 @@ export default {
           .split(",")
           .map(x => x.trim())
           .filter(Boolean);
-    
+
         const errorText =
           `⚠️ WORKER ERROR\n\n` +
           `${String(e?.message || e).slice(0,1200)}`;
-    
+
         for (const adminId of adminIds) {
           try {
             await sendMessage(env, adminId, errorText);
           } catch (_) {}
         }
       } catch (_) {}
-    
+
       return json({
         ok: false,
         error: "internal_error"

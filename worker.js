@@ -10,6 +10,13 @@ const FB_SCOPE = "https://www.googleapis.com/auth/firebase.database https://www.
 const QUALITIES = ["360p","480p","720p","1080p","1440p","2160p"];
 const GENRES = ["Action","Adventure","Animation","Comedy","Crime","Documentary","Drama","Fantasy","Horror","Mystery","Romance","Sci-Fi","Thriller","War","Western","Family"];
 
+// ---- Konfigurasi Scraper (Bagian A) ------------------------------------
+const SCRAPE_TIMEOUT_MS = 12000;
+const SCRAPE_MAX_HTML_CHARS = 3_000_000; // batas ukuran HTML yang diproses (~3MB)
+const SCRAPE_MAX_CANDIDATES = 20;
+const SUBTITLE_TIMEOUT_MS = 12000;
+const SUBTITLE_MAX_BYTES = 5 * 1024 * 1024;
+
 function isAdmin(from, env) {
   const ids = String(env.ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean);
   return ids.includes(String(from?.id || ""));
@@ -247,6 +254,232 @@ function isValidVideoUrl(text) {
   }
 }
 
+// ---- Scraper media publik (Bagian A) -----------------------------------
+// Hanya membaca HTML publik lewat fetch() biasa. Tidak ada bypass proteksi
+// apapun: 401/403/429 langsung dilaporkan sebagai "tidak dapat diakses".
+
+async function fetchWithTimeout(url, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; IDFLIXBot/1.0; +scraper)",
+        "accept": "text/html,application/xhtml+xml"
+      }
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Deteksi kualitas dari string URL/file name. Tidak pernah menebak dari
+// ukuran file atau resolusi asli — murni pattern matching string.
+function detectQuality(url) {
+  const s = String(url || "");
+  const N = "(360|480|720|1080|1440|2160)";
+  // Prioritas pola dengan delimiter jelas saja — tidak menebak dari angka
+  // sembarang yang kebetulan muncul di URL (mis. id, timestamp, dsb).
+  const patterns = [
+    new RegExp(`${N}p\\b`, "i"),                                   // 720p
+    new RegExp(`[\\/_-]${N}(?=[\\/_-])`, "i"),                     // /720/ _720_ -720-
+    new RegExp(`${N}(?=\\.(?:mp4|m3u8)(?:[?#]|$))`, "i")           // 720.mp4 / 720.m3u8
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) return `${m[1]}p`;
+  }
+  if (/cam/i.test(s)) return "CAM";
+  return "UNKNOWN";
+}
+
+function mediaTypeFromUrl(u) {
+  if (/\.m3u8(?:[?#]|$)/i.test(u)) return "M3U8";
+  if (/\.mp4(?:[?#]|$)/i.test(u)) return "MP4";
+  return null;
+}
+
+function resolveMediaUrl(candidate, baseUrl) {
+  try {
+    return new URL(candidate, baseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+// Ekstrak kandidat MP4/M3U8 dari HTML: URL absolut langsung di teks,
+// atribut umum (src, data-src, data-video, dst pada <video>/<source>),
+// dan pola JS/JSON inline seperti file:"..." atau source:"...".
+// Menangani juga string yang di-escape ("\/" -> "/") dan URL
+// protocol-relative ("//cdn..."), yang diresolve lewat resolveMediaUrl().
+// Deduplikasi berdasarkan URL absolut hasil resolve.
+function extractMediaUrls(html, pageUrl) {
+  // Normalisasi escaped slash yang umum muncul di JSON/JS inline, contoh:
+  // "https:\/\/cdn.example.com\/video.mp4", "\/video\/x.mp4", atau bentuk
+  // unicode escape "https:\u002F\u002Fcdn.example.com\u002Fvideo.mp4".
+  // Juga decode HTML entity "&amp;" yang umum muncul di query string URL.
+  // Tidak menyentuh URL yang sudah valid (replace di sini idempoten).
+  let normalized = String(html || "")
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+
+  const found = new Map();
+  const patterns = [
+    /https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8)(?:\?[^\s"'<>\\]*)?/gi,
+    /(?:src|data-src|data-video|data-url|data-file|data-source|data-stream|file|source|url)\s*[:=]\s*["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi,
+    // Fallback generik: string ter-quote apapun (property JSON/JS non-standar
+    // termasuk) yang berakhir .mp4/.m3u8. Aman karena tetap difilter lewat
+    // mediaTypeFromUrl() + resolveMediaUrl() dan dideduplikasi di bawah.
+    /["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi
+  ];
+  for (const re of patterns) {
+    let match;
+    let guard = 0;
+    while ((match = re.exec(normalized)) && guard < 500) {
+      guard++;
+      const raw = match[1] || match[0];
+      const abs = resolveMediaUrl(raw, pageUrl);
+      if (!abs) continue;
+      const type = mediaTypeFromUrl(abs);
+      if (!type) continue;
+      if (found.has(abs)) continue;
+      found.set(abs, {url: abs, type, quality: detectQuality(abs)});
+    }
+  }
+  return Array.from(found.values());
+}
+
+// Ambil HTML publik dan validasi. Mengembalikan {error:...} untuk setiap
+// kondisi gagal, atau {ok:true, candidates:[...]} jika berhasil.
+async function scrapePage(pageUrl) {
+  let res;
+  try {
+    res = await fetchWithTimeout(pageUrl, SCRAPE_TIMEOUT_MS);
+  } catch (e) {
+    if (e?.name === "AbortError") return {error: "timeout"};
+    return {error: "network", detail: String(e?.message || e)};
+  }
+
+  // 401/403/429 atau halaman yang meminta login/CAPTCHA: laporkan, jangan bypass.
+  if (res.status === 401 || res.status === 403 || res.status === 429) {
+    return {error: "protected", status: res.status};
+  }
+  if (res.status === 404) return {error: "notfound-http"};
+  if (res.status >= 500) return {error: "server", status: res.status};
+  if (res.status === 400) return {error: "badrequest"};
+  if (!res.ok) return {error: "http", status: res.status};
+
+  const ct = res.headers.get("content-type") || "";
+  if (!/text\/html|application\/xhtml\+xml/i.test(ct)) {
+    return {error: "nothtml", contentType: ct};
+  }
+
+  let html;
+  try {
+    html = await res.text();
+  } catch (e) {
+    return {error: "network", detail: String(e?.message || e)};
+  }
+  if (!html || !html.trim()) return {error: "empty"};
+  if (html.length > SCRAPE_MAX_HTML_CHARS) html = html.slice(0, SCRAPE_MAX_HTML_CHARS);
+
+  const candidates = extractMediaUrls(html, res.url || pageUrl);
+  if (!candidates.length) return {error: "notfound"};
+
+  return {ok: true, candidates};
+}
+
+function scrapeKeyboard(candidates) {
+  const rows = candidates.map((c, i) => [{text: `▶ ${c.quality} ${c.type}`, callback_data: `sc_pick:${i}`}]);
+  rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
+  return {inline_keyboard: rows};
+}
+
+// Dipakai saat kandidat scrape terdeteksi CAM/UNKNOWN: admin WAJIB memilih
+// quality database resmi (QUALITIES) — CAM/UNKNOWN tidak pernah menjadi key.
+function dbQualityKeyboard() {
+  const rows = [];
+  for (let i = 0; i < QUALITIES.length; i += 3) {
+    rows.push(QUALITIES.slice(i, i + 3).map(q => ({text: q, callback_data: `sc_qpick:${q}`})));
+  }
+  rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
+  return {inline_keyboard: rows};
+}
+
+// Bangun teks + keyboard konfirmasi (tambah baru vs overwrite) berdasarkan
+// state.targetQuality yang SUDAH pasti berupa quality resmi (QUALITIES).
+function buildScrapeDecision(movie, state) {
+  const quality = state.targetQuality;
+  const exists = !!migratedVideos(movie)[quality];
+  const text = exists
+    ? `⚠️ ${quality} sudah tersedia untuk film ${movie.title}.\n🔗 URL baru: ${state.pending.url}`
+    : `🎬 ${movie.title}\n\nQuality: ${quality}\nType: ${state.pending.type}\n🔗 ${state.pending.url}\n\nTambahkan kualitas ini ke film?`;
+  const keyboard = exists
+    ? {inline_keyboard: [
+        [{text: "♻️ Overwrite URL", callback_data: "sc_overwrite"}],
+        [{text: "❌ Batal", callback_data: "cancel"}]
+      ]}
+    : {inline_keyboard: [
+        [{text: "✅ Tambah ke Film", callback_data: "sc_confirmadd"}],
+        [{text: "❌ Batal", callback_data: "cancel"}]
+      ]};
+  return {text, keyboard};
+}
+
+// ---- Subtitle manual (Bagian B) -----------------------------------------
+// Migrasi runtime untuk film lama yang hanya punya {videoUrl, quality} di
+// root (tanpa map "videos"). TIDAK menghapus field lama itu — hanya
+// menyusun map "videos" yang setara untuk dipakai baca/tulis quality.
+function migratedVideos(movie) {
+  const videos = {...(movie?.videos || {})};
+  if (movie?.quality && movie?.videoUrl && !videos[movie.quality] && QUALITIES.includes(movie.quality)) {
+    videos[movie.quality] = {videoUrl: movie.videoUrl, provider: movie.provider || "custom"};
+  }
+  return videos;
+}
+
+// Quality yang tersedia untuk sebuah film, aman untuk film lama yang
+// hanya punya {videoUrl, quality} tanpa map "videos". Hanya quality resmi
+// (QUALITIES) yang ditawarkan — bukan CAM/UNKNOWN.
+function getAvailableQualities(movie) {
+  const videos = migratedVideos(movie);
+  return QUALITIES.filter(q => videos[q]);
+}
+
+function subtitleQualityKeyboard(qualities) {
+  const rows = [];
+  for (let i = 0; i < qualities.length; i += 3) {
+    rows.push(qualities.slice(i, i + 3).map(q => ({text: q, callback_data: `sub_q:${q}`})));
+  }
+  rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
+  return {inline_keyboard: rows};
+}
+
+// Konversi SRT sederhana ke WebVTT: ganti koma->titik pada timestamp,
+// hapus nomor urutan cue, pastikan header WEBVTT.
+function srtToVtt(srt) {
+  let text = String(srt || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  text = text.replace(/^\uFEFF/, "");
+  // Dukung jam 1 atau 2 digit (0:01:02,500 maupun 00:01:02,500); hasil
+  // dinormalisasi ke jam 2 digit + titik desimal sesuai format WebVTT.
+  text = text.replace(/(\d{1,2}):(\d{2}):(\d{2}),(\d{3})/g,
+    (_, h, m, sec, ms) => `${h.padStart(2,"0")}:${m}:${sec}.${ms}`);
+  text = text.replace(/^\d+\s*$/gm, "");
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+  return `WEBVTT\n\n${text}\n`;
+}
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Range"
+  };
+}
+
 function qualityKeyboard(selected = "") {
   return {
     inline_keyboard: [
@@ -364,6 +597,50 @@ async function handleAdminText(msg, env) {
     return;
   }
 
+  // File subtitle (.srt/.vtt) dikirim sebagai Telegram document, hanya
+  // diproses jika admin sedang berada dalam alur /subtitle.
+  if (msg.document) {
+    const state = await getState(env, userId);
+    if (state?.mode === "subtitle" && state.step === "await_subtitle_file") {
+      const fileName = String(msg.document.file_name || "");
+      const ext = (fileName.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+      if (ext !== "srt" && ext !== "vtt") {
+        await sendMessage(env, chatId, "❌ Format subtitle tidak didukung.\nGunakan .srt atau .vtt");
+        return;
+      }
+      const movie = await getMovie(env, state.movieId);
+      if (!movie) {
+        await delState(env, userId);
+        await sendMessage(env, chatId, "❌ Film tidak ditemukan lagi di database.");
+        return;
+      }
+      const videos = migratedVideos(movie);
+      if (!videos[state.quality]) {
+        await delState(env, userId);
+        await sendMessage(env, chatId, "❌ Kualitas tersebut tidak lagi tersedia pada film ini.");
+        return;
+      }
+      const hadSubtitle = !!videos[state.quality].subtitle;
+      videos[state.quality] = {
+        ...videos[state.quality],
+        subtitle: {
+          fileId: msg.document.file_id,
+          fileName: fileName || `subtitle.${ext}`,
+          language: "id",
+          format: ext
+        }
+      };
+      await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, {videos});
+      await delState(env, userId);
+      await sendMessage(env, chatId, hadSubtitle
+        ? `✅ Subtitle ${state.quality} berhasil diperbarui.`
+        : `✅ Subtitle ${state.quality} berhasil disimpan.`);
+      return;
+    }
+    // Document di luar alur /subtitle: abaikan, jangan ganggu fitur lain.
+    return;
+  }
+
   if (text === "/id") {
     await sendMessage(env, chatId, `Telegram ID kamu: ${msg.from.id}`);
     return;
@@ -374,6 +651,8 @@ async function handleAdminText(msg, env) {
       "1. Upload poster film (gambar)\n" +
       "2. /simpan <judul> — tambah film baru\n" +
       "3. /tambah <judul> — tambah kualitas video ke film yang sudah ada\n\n" +
+      "/scrape <url> — cari URL MP4/M3U8 publik dari halaman\n" +
+      "/subtitle <judul> — upload subtitle .srt/.vtt untuk film\n" +
       "/list — daftar film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
     return;
   }
@@ -430,10 +709,99 @@ async function handleAdminText(msg, env) {
     return;
   }
 
+  if (text.startsWith("/scrape ")) {
+    const raw = text.slice(8).trim();
+    if (!raw) return sendMessage(env, chatId, "Format: /scrape <URL>");
+    let target;
+    try {
+      target = new URL(raw);
+      if (!/^https?:$/.test(target.protocol)) throw new Error("bad-protocol");
+    } catch {
+      return sendMessage(env, chatId, "❌ URL tidak valid. Format: /scrape https://...");
+    }
+
+    await sendMessage(env, chatId, "🔍 Memindai halaman, mohon tunggu...");
+    const result = await scrapePage(target.toString());
+
+    if (result.error === "timeout") return sendMessage(env, chatId, "⏱️ Permintaan ke halaman timeout. Coba lagi nanti.");
+    if (result.error === "protected") return sendMessage(env, chatId,
+      `⚠️ Halaman tidak dapat diakses sebagai resource publik (status ${result.status}).\n\nScraper tidak melakukan bypass login/CAPTCHA/DRM/anti-bot.`);
+    if (result.error === "notfound-http") return sendMessage(env, chatId, "❌ Halaman tidak ditemukan (404).");
+    if (result.error === "server") return sendMessage(env, chatId, `❌ Server halaman mengalami error (status ${result.status}). Coba lagi nanti.`);
+    if (result.error === "badrequest") return sendMessage(env, chatId, "❌ Permintaan tidak valid (400). Periksa kembali URL.");
+    if (result.error === "http") return sendMessage(env, chatId, `❌ Gagal mengambil halaman (status ${result.status}).`);
+    if (result.error === "nothtml") return sendMessage(env, chatId, `ℹ️ Resource bukan halaman HTML yang dapat dipindai (content-type: ${result.contentType || "-"}).`);
+    if (result.error === "empty") return sendMessage(env, chatId, "❌ Halaman kosong, tidak ada konten untuk dipindai.");
+    if (result.error === "network") return sendMessage(env, chatId, `❌ Gagal mengakses URL: ${result.detail || "unknown error"}`);
+    if (result.error === "notfound") return sendMessage(env, chatId, "❌ Tidak ditemukan URL MP4/M3U8 publik pada halaman tersebut.");
+
+    const candidates = result.candidates.slice(0, SCRAPE_MAX_CANDIDATES);
+    const truncated = result.candidates.length > SCRAPE_MAX_CANDIDATES;
+    const state = {userId, mode: "scrape", chatId, candidates, createdAt: Date.now()};
+    await putState(env, userId, state);
+
+    const lines = candidates.map((c, i) => `${i + 1}. 🎬 ${c.quality}\n   ${c.type}\n   ${c.url}`);
+    const extra = truncated ? `\n\n...ditemukan lebih banyak, hanya ${SCRAPE_MAX_CANDIDATES} kandidat pertama yang ditampilkan.` : "";
+    await sendMessage(env, chatId, `🔎 Hasil Scrape (${candidates.length})\n\n${lines.join("\n\n")}${extra}`,
+      {reply_markup: scrapeKeyboard(candidates)});
+    return;
+  }
+
+  if (text.startsWith("/subtitle ")) {
+    const title = text.slice(10).trim();
+    if (!title) return sendMessage(env, chatId, "Format: /subtitle <judul film>");
+    const found = await findMovieByTitle(env, title);
+    if (!found) return sendMessage(env, chatId, `❌ Film "${title}" tidak ditemukan di database.`);
+    const availableQualities = getAvailableQualities(found.movie);
+    if (!availableQualities.length) {
+      return sendMessage(env, chatId, `⚠️ Film "${found.movie.title}" belum memiliki kualitas video apapun.`);
+    }
+    const state = {
+      userId, mode: "subtitle", chatId,
+      movieId: found.id, movieTitle: found.movie.title,
+      availableQualities, createdAt: Date.now()
+    };
+    await putState(env, userId, state);
+    await sendMessage(env, chatId, `🎬 ${found.movie.title}\n\nPilih kualitas subtitle:`,
+      {reply_markup: subtitleQualityKeyboard(availableQualities)});
+    return;
+  }
+
   const state = await getState(env, userId);
   if (!state) return;
 
   if (!text) return; // abaikan pesan non-teks lain di luar flow yang dikenal
+
+  if (state.mode === "scrape" && state.step === "await_title") {
+    const title = text.trim();
+    if (!title) return;
+    const found = await findMovieByTitle(env, title);
+    if (!found) {
+      await sendMessage(env, chatId,
+        `❌ Film "${title}" belum ditemukan. Gunakan /tambah <judul> atau /simpan <judul> untuk membuat film ini terlebih dahulu, lalu ulangi memilih kandidat scrape.\n\nKetik judul lain atau /batal untuk membatalkan.`);
+      return;
+    }
+    state.movieId = found.id;
+    const detected = state.pending.quality;
+
+    if (QUALITIES.includes(detected)) {
+      // Quality terdeteksi valid (bukan CAM/UNKNOWN) — langsung dipakai.
+      state.targetQuality = detected;
+      delete state.step;
+      await putState(env, userId, state);
+      const decision = buildScrapeDecision(found.movie, state);
+      await sendMessage(env, chatId, decision.text, {reply_markup: decision.keyboard});
+    } else {
+      // CAM/UNKNOWN: jangan pernah jadi key database. Admin wajib pilih
+      // quality resmi dari daftar QUALITIES.
+      state.step = "await_quality_pick";
+      await putState(env, userId, state);
+      await sendMessage(env, chatId,
+        `ℹ️ Kualitas terdeteksi: ${detected} (bukan quality database resmi).\n\nPilih quality database yang sesuai untuk film ${found.movie.title}:`,
+        {reply_markup: dbQualityKeyboard()});
+    }
+    return;
+  }
 
   if ((state.mode === "simpan" || state.mode === "tambah") && !state.videoUrl) {
     if (!isValidVideoUrl(text)) {
@@ -493,7 +861,7 @@ async function handleCallback(q, env) {
 
     if (state.mode === "tambah" && state.movieId) {
       const movie = await getMovie(env, state.movieId);
-      if (movie?.videos?.[chosen]) {
+      if (movie && migratedVideos(movie)[chosen]) {
         await answerCallback(env, q.id, `Kualitas ${chosen} sudah ada. Pilih kualitas lain.`);
         return;
       }
@@ -605,17 +973,149 @@ async function handleCallback(q, env) {
     return;
   }
 
+  // ---- Callback Scraper (Bagian A) ----
+  if (data.startsWith("sc_pick:")) {
+    if (state.mode !== "scrape" || !Array.isArray(state.candidates)) {
+      return answerCallback(env, q.id, "Sesi scrape tidak valid.");
+    }
+    const idx = Number(data.slice(8));
+    const cand = state.candidates[idx];
+    if (!cand) return answerCallback(env, q.id, "Kandidat tidak ditemukan.");
+    state.pending = cand;
+    delete state.step;
+    delete state.movieId;
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, `Dipilih: ${cand.quality} ${cand.type}`);
+    await editMessage(env, chatId, msg.message_id,
+      `🎬 URL ditemukan\n\nQuality: ${cand.quality}\nType: ${cand.type}\n🔗 ${cand.url}\n\nPilih tindakan:`, {
+        reply_markup: {inline_keyboard: [
+          [{text: "➕ Tambah ke Film", callback_data: "sc_addfilm"}],
+          [{text: "❌ Batalkan", callback_data: "cancel"}]
+        ]}
+      });
+    return;
+  }
+
+  if (data === "sc_addfilm") {
+    if (state.mode !== "scrape" || !state.pending) return answerCallback(env, q.id, "Pilih kandidat terlebih dahulu.");
+    state.step = "await_title";
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, "Ketik judul film");
+    await editMessage(env, chatId, msg.message_id,
+      "📌 Ketik judul film tujuan (harus sudah ada di database, gunakan judul yang sama seperti /tambah).");
+    return;
+  }
+
+  // CAM/UNKNOWN: admin memilih quality database resmi dari QUALITIES.
+  if (data.startsWith("sc_qpick:")) {
+    if (state.mode !== "scrape" || state.step !== "await_quality_pick" || !state.movieId || !state.pending) {
+      return answerCallback(env, q.id, "Sesi scrape tidak valid.");
+    }
+    const chosen = data.slice(9);
+    if (!QUALITIES.includes(chosen)) return answerCallback(env, q.id, "Quality tidak valid.");
+    const movie = await getMovie(env, state.movieId);
+    if (!movie) {
+      await delState(env, userId);
+      await answerCallback(env, q.id, "Film tidak ditemukan.");
+      await editMessage(env, chatId, msg.message_id, "❌ Film tidak ditemukan lagi di database.");
+      return;
+    }
+    state.targetQuality = chosen;
+    delete state.step;
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, `Quality dipilih: ${chosen}`);
+    const decision = buildScrapeDecision(movie, state);
+    await editMessage(env, chatId, msg.message_id, decision.text, {reply_markup: decision.keyboard});
+    return;
+  }
+
+  if (data === "sc_confirmadd") {
+    if (state.mode !== "scrape" || !state.pending || !state.movieId || !state.targetQuality) {
+      return answerCallback(env, q.id, "Data belum lengkap.");
+    }
+    const movie = await getMovie(env, state.movieId);
+    if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
+    const quality = state.targetQuality;
+    const videos = migratedVideos(movie);
+    if (videos[quality]) {
+      await answerCallback(env, q.id, "Kualitas sudah ada, gunakan Overwrite.");
+      return;
+    }
+    // Quality baru: tidak ada object lama untuk dipertahankan, tapi tetap
+    // pakai pola spread yang sama supaya konsisten dengan overwrite.
+    videos[quality] = {
+      ...(videos[quality] || {}),
+      videoUrl: state.pending.url,
+      provider: "scrape",
+      format: state.pending.type
+    };
+    const patch = {videos};
+    if (!movie.videoUrl) patch.videoUrl = state.pending.url;
+    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
+    await delState(env, userId);
+    await answerCallback(env, q.id, "Ditambahkan.");
+    await editMessage(env, chatId, msg.message_id,
+      `✅ Kualitas ${quality} berhasil ditambahkan ke ${movie.title} dari hasil scrape.\n🔗 ${state.pending.url}`);
+    return;
+  }
+
+  if (data === "sc_overwrite") {
+    if (state.mode !== "scrape" || !state.pending || !state.movieId || !state.targetQuality) {
+      return answerCallback(env, q.id, "Data belum lengkap.");
+    }
+    const movie = await getMovie(env, state.movieId);
+    if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
+    const quality = state.targetQuality;
+    const videos = migratedVideos(movie);
+    // PENTING: pertahankan metadata lama (termasuk subtitle) pada quality
+    // ini — hanya videoUrl/provider/format yang diganti.
+    videos[quality] = {
+      ...(videos[quality] || {}),
+      videoUrl: state.pending.url,
+      provider: "scrape",
+      format: state.pending.type
+    };
+    const patch = {videos};
+    // Sinkronkan field legacy jika film lama masih menjadikan quality ini
+    // sebagai video utama. Ini mencegah frontend lama membaca URL yang stale.
+    if (movie.quality === quality) {
+      patch.videoUrl = state.pending.url;
+      patch.quality = quality;
+      patch.provider = "scrape";
+    }
+    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
+    await delState(env, userId);
+    await answerCallback(env, q.id, "Diperbarui.");
+    await editMessage(env, chatId, msg.message_id,
+      `✅ ${quality} berhasil diperbarui (overwrite) untuk ${movie.title}. Subtitle & metadata lain pada quality ini tetap dipertahankan.\n🔗 ${state.pending.url}`);
+    return;
+  }
+
+  // ---- Callback Subtitle (Bagian B) ----
+  if (data.startsWith("sub_q:")) {
+    if (state.mode !== "subtitle") return answerCallback(env, q.id, "Sesi subtitle tidak valid.");
+    const quality = data.slice(6);
+    if (!state.availableQualities?.includes(quality)) return answerCallback(env, q.id, "Kualitas tidak tersedia untuk film ini.");
+    state.quality = quality;
+    state.step = "await_subtitle_file";
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, `Kualitas ${quality}`);
+    await editMessage(env, chatId, msg.message_id,
+      `📄 Silakan kirim file subtitle untuk ${state.movieTitle} (${quality}).\n\nFormat:\n• .srt\n• .vtt\n\nBahasa default: Indonesia`);
+    return;
+  }
+
   if (data === "confirm_add") {
     if (!state.movieId || !state.videoUrl || !state.quality) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
-    if (movie.videos?.[state.quality]) {
+    if (migratedVideos(movie)[state.quality]) {
       await answerCallback(env, q.id, "Kualitas itu sudah ada.");
       await editMessage(env, chatId, msg.message_id, `⚠️ Kualitas ${state.quality} sudah ada untuk film ini. Data lama tidak ditimpa.`);
       await delState(env, userId);
       return;
     }
-    const videos = {...(movie.videos || {})};
+    const videos = migratedVideos(movie);
     videos[state.quality] = {videoUrl: state.videoUrl, provider: "custom"};
     const patch = {videos};
     if (!movie.videoUrl) patch.videoUrl = state.videoUrl; // hanya isi jika film lama belum punya videoUrl utama
@@ -747,6 +1247,75 @@ async function proxyTelegramPoster(request, env) {
   return proxyTelegramMedia(request, env, "/poster/", "image/jpeg", "public, max-age=86400");
 }
 
+// ---- Endpoint subtitle: Firebase -> Telegram getFile -> SRT/VTT --------
+// Browser tidak pernah melihat BOT_TOKEN. Path: /subtitle/<filmId>/<quality>
+async function serveSubtitle(request, env) {
+  const url = new URL(request.url);
+  const parts = url.pathname.split("/").filter(Boolean); // ["subtitle", filmId, quality]
+  const filmId = decodeURIComponent(parts[1] || "");
+  const quality = decodeURIComponent(parts[2] || "");
+  if (!filmId || !quality) {
+    return new Response("Missing filmId/quality", {status: 400, headers: corsHeaders()});
+  }
+  if (!QUALITIES.includes(quality)) {
+    return new Response("Quality tidak valid", {status: 400, headers: corsHeaders()});
+  }
+
+  const movie = await getMovie(env, filmId);
+  if (!movie) return new Response("Film tidak ditemukan", {status: 404, headers: corsHeaders()});
+
+  const sub = migratedVideos(movie)[quality]?.subtitle;
+  if (!sub?.fileId) return new Response("Subtitle tidak tersedia", {status: 404, headers: corsHeaders()});
+
+  const meta = await tg(env, "getFile", {file_id: sub.fileId});
+  if (!meta?.file_path) return new Response("Telegram file_path tidak tersedia", {status: 502, headers: corsHeaders()});
+
+  let upstream;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SUBTITLE_TIMEOUT_MS);
+    try {
+      upstream = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${meta.file_path}`, {
+        signal: controller.signal,
+        redirect: "follow"
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    const msg = e?.name === "AbortError" ? "Telegram subtitle timeout" : "Telegram subtitle fetch gagal";
+    return new Response(msg, {status: 504, headers: corsHeaders()});
+  }
+
+  if (!upstream.ok) {
+    const t = await upstream.text().catch(() => "");
+    return new Response(`Telegram file error: ${upstream.status} ${t.slice(0, 300)}`, {status: 502, headers: corsHeaders()});
+  }
+
+  const contentLength = Number(upstream.headers.get("content-length") || 0);
+  if (contentLength > SUBTITLE_MAX_BYTES) {
+    return new Response("Subtitle terlalu besar", {status: 413, headers: corsHeaders()});
+  }
+
+  const rawText = await upstream.text();
+  if (new TextEncoder().encode(rawText).byteLength > SUBTITLE_MAX_BYTES) {
+    return new Response("Subtitle terlalu besar", {status: 413, headers: corsHeaders()});
+  }
+  const isVtt = (sub.format || "").toLowerCase() === "vtt" || /\.vtt$/i.test(sub.fileName || "");
+  const vtt = isVtt
+    ? (rawText.trim().startsWith("WEBVTT") ? rawText : `WEBVTT\n\n${rawText}`)
+    : srtToVtt(rawText);
+
+  return new Response(vtt, {
+    status: 200,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "text/vtt; charset=utf-8",
+      "Cache-Control": "public, max-age=3600"
+    }
+  });
+}
+
 async function diagnostic(env) {
   const envInfo = {
     BOT_TOKEN: !!env.BOT_TOKEN,
@@ -805,6 +1374,10 @@ export default {
     if (request.method === "GET" && url.pathname.startsWith("/poster/")) {
       try { return await proxyTelegramPoster(request, env); }
       catch (e) { return new Response(String(e.message || e), {status:502}); }
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/subtitle/")) {
+      try { return await serveSubtitle(request, env); }
+      catch (e) { return new Response(String(e.message || e), {status:502, headers: corsHeaders()}); }
     }
     if (request.method !== "POST") return new Response("Method Not Allowed",{status:405});
 

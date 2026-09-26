@@ -14,6 +14,8 @@ const GENRES = ["Action","Adventure","Animation","Comedy","Crime","Documentary",
 const SCRAPE_TIMEOUT_MS = 12000;
 const SCRAPE_MAX_HTML_CHARS = 3_000_000; // batas ukuran HTML yang diproses (~3MB)
 const SCRAPE_MAX_CANDIDATES = 20;
+const SCRAPE_MAX_DISCOVERY_PAGES = 8;
+const SCRAPE_MAX_DISCOVERY_DEPTH = 2;
 const SUBTITLE_TIMEOUT_MS = 12000;
 const SUBTITLE_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -315,81 +317,174 @@ function resolveMediaUrl(candidate, baseUrl) {
 // Menangani juga string yang di-escape ("\/" -> "/") dan URL
 // protocol-relative ("//cdn..."), yang diresolve lewat resolveMediaUrl().
 // Deduplikasi berdasarkan URL absolut hasil resolve.
-function extractMediaUrls(html, pageUrl) {
-  // Normalisasi escaped slash yang umum muncul di JSON/JS inline, contoh:
-  // "https:\/\/cdn.example.com\/video.mp4", "\/video\/x.mp4", atau bentuk
-  // unicode escape "https:\u002F\u002Fcdn.example.com\u002Fvideo.mp4".
-  // Juga decode HTML entity "&amp;" yang umum muncul di query string URL.
-  // Tidak menyentuh URL yang sudah valid (replace di sini idempoten).
-  let normalized = String(html || "")
-    .replace(/\\u002f/gi, "/")
-    .replace(/\\\//g, "/")
+function normalizeScrapeText(html) {
+  return String(html || "")
+    .replace(/\u002f/gi, "/")
+    .replace(/\u0026/gi, "&")
+    .replace(/\\//g, "/")
     .replace(/&amp;/gi, "&");
+}
 
+function isObviouslyPrivateHost(url) {
+  try {
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase();
+    if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local")) return true;
+    if (h === "0.0.0.0" || h === "::1") return true;
+    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (!m) return false;
+    const a = Number(m[1]), b = Number(m[2]);
+    return a === 10 || a === 127 || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  } catch {
+    return true;
+  }
+}
+
+function extractPublicLinks(html, pageUrl) {
+  const normalized = normalizeScrapeText(html);
+  const found = new Map();
+  const add = (raw, kind) => {
+    if (!raw) return;
+    const value = String(raw).trim();
+    if (!/^https?:\/\//i.test(value) && !value.startsWith("//") && !value.startsWith("/")) return;
+    const abs = resolveMediaUrl(value, pageUrl);
+    if (!abs || isObviouslyPrivateHost(abs)) return;
+    try {
+      const u = new URL(abs);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return;
+      found.set(abs, {url: abs, kind});
+    } catch {}
+  };
+
+  const patterns = [
+    /<iframe[^>]+(?:src|data-src)\s*=\s*["']([^"']+)["']/gi,
+    /<(?:script|source)[^>]+src\s*=\s*["']([^"']+)["']/gi,
+    /(?:player|embed|iframe|source|file|url|src)\s*[:=]\s*["']([^"']+)["']/gi
+  ];
+  for (const re of patterns) {
+    let m, guard = 0;
+    while ((m = re.exec(normalized)) && guard++ < 300) add(m[1], /iframe|embed/i.test(m[0]) ? "iframe" : "script");
+  }
+  return Array.from(found.values());
+}
+
+// Ekstrak kandidat MP4/M3U8 dari HTML/JS publik. Termasuk URL absolut,
+// atribut HTML, konfigurasi player JSON/JS, URL relative dan escaped URL.
+function extractMediaUrls(html, pageUrl) {
+  const normalized = normalizeScrapeText(html);
   const found = new Map();
   const patterns = [
     /https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8)(?:\?[^\s"'<>\\]*)?/gi,
-    /(?:src|data-src|data-video|data-url|data-file|data-source|data-stream|file|source|url)\s*[:=]\s*["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi,
-    // Fallback generik: string ter-quote apapun (property JSON/JS non-standar
-    // termasuk) yang berakhir .mp4/.m3u8. Aman karena tetap difilter lewat
-    // mediaTypeFromUrl() + resolveMediaUrl() dan dideduplikasi di bawah.
+    /(?:src|data-src|data-video|data-url|data-file|data-source|data-stream|file|source|url|playlist|manifest)\s*[:=]\s*["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi,
     /["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi
   ];
   for (const re of patterns) {
-    let match;
-    let guard = 0;
-    while ((match = re.exec(normalized)) && guard < 500) {
-      guard++;
+    let match, guard = 0;
+    while ((match = re.exec(normalized)) && guard < 1000) {
       const raw = match[1] || match[0];
       const abs = resolveMediaUrl(raw, pageUrl);
-      if (!abs) continue;
+      if (!abs || isObviouslyPrivateHost(abs)) continue;
       const type = mediaTypeFromUrl(abs);
-      if (!type) continue;
-      if (found.has(abs)) continue;
+      if (!type || found.has(abs)) continue;
       found.set(abs, {url: abs, type, quality: detectQuality(abs)});
     }
   }
   return Array.from(found.values());
 }
 
-// Ambil HTML publik dan validasi. Mengembalikan {error:...} untuk setiap
-// kondisi gagal, atau {ok:true, candidates:[...]} jika berhasil.
-async function scrapePage(pageUrl) {
-  let res;
+async function fetchPublicDiscovery(url) {
+  if (isObviouslyPrivateHost(url)) return {error: "private-host"};
   try {
-    res = await fetchWithTimeout(pageUrl, SCRAPE_TIMEOUT_MS);
+    const res = await fetchWithTimeout(url, SCRAPE_TIMEOUT_MS);
+    if (res.status === 401 || res.status === 403 || res.status === 429) {
+      return {error: "protected", status: res.status};
+    }
+    if (!res.ok) return {error: "http", status: res.status};
+    const ct = res.headers.get("content-type") || "";
+    if (!/text\/html|application\/xhtml\+xml|javascript|json/i.test(ct)) {
+      return {error: "not-text", contentType: ct};
+    }
+    let body = await res.text();
+    if (body.length > SCRAPE_MAX_HTML_CHARS) body = body.slice(0, SCRAPE_MAX_HTML_CHARS);
+    return {ok: true, body, url: res.url || url, contentType: ct};
   } catch (e) {
     if (e?.name === "AbortError") return {error: "timeout"};
     return {error: "network", detail: String(e?.message || e)};
   }
+}
 
-  // 401/403/429 atau halaman yang meminta login/CAPTCHA: laporkan, jangan bypass.
-  if (res.status === 401 || res.status === 403 || res.status === 429) {
-    return {error: "protected", status: res.status};
+// Discovery bertingkat hanya mengikuti resource yang dapat diakses secara publik.
+// Tidak mengirim cookie/session/auth header dan tidak mencoba melewati proteksi.
+async function discoverPublicMedia(startUrl) {
+  const queue = [{url: startUrl, depth: 0, kind: "page"}];
+  const visited = new Set();
+  const candidates = new Map();
+  let firstError = null;
+  let pagesScanned = 0;
+
+  while (queue.length && pagesScanned < SCRAPE_MAX_DISCOVERY_PAGES && candidates.size < SCRAPE_MAX_CANDIDATES) {
+    const item = queue.shift();
+    if (!item?.url || visited.has(item.url)) continue;
+    visited.add(item.url);
+    pagesScanned++;
+
+    const r = await fetchPublicDiscovery(item.url);
+    if (!r.ok) {
+      if (!firstError && (r.error === "protected" || r.error === "timeout")) firstError = r;
+      continue;
+    }
+
+    for (const c of extractMediaUrls(r.body, r.url)) {
+      if (!candidates.has(c.url)) {
+        candidates.set(c.url, {...c, discoveredFrom: r.url, via: item.kind});
+      }
+    }
+    if (candidates.size >= SCRAPE_MAX_CANDIDATES) break;
+    if (item.depth >= SCRAPE_MAX_DISCOVERY_DEPTH) continue;
+
+    for (const link of extractPublicLinks(r.body, r.url)) {
+      if (visited.has(link.url) || queue.some(x => x.url === link.url)) continue;
+      // Follow iframe/player pages and external JS/JSON configs. Do not crawl
+      // arbitrary site links: only explicit player/embed/script references.
+      if (link.kind === "iframe" || link.kind === "script") {
+        queue.push({url: link.url, depth: item.depth + 1, kind: link.kind});
+      }
+      if (queue.length >= SCRAPE_MAX_DISCOVERY_PAGES) break;
+    }
   }
-  if (res.status === 404) return {error: "notfound-http"};
-  if (res.status >= 500) return {error: "server", status: res.status};
-  if (res.status === 400) return {error: "badrequest"};
-  if (!res.ok) return {error: "http", status: res.status};
 
-  const ct = res.headers.get("content-type") || "";
-  if (!/text\/html|application\/xhtml\+xml/i.test(ct)) {
-    return {error: "nothtml", contentType: ct};
+  return {
+    candidates: Array.from(candidates.values()),
+    pagesScanned,
+    firstError
+  };
+}
+
+// Ambil HTML publik dan validasi. Mengembalikan {error:...} untuk setiap
+// kondisi gagal, atau {ok:true, candidates:[...]} jika berhasil.
+async function scrapePage(pageUrl) {
+  if (isObviouslyPrivateHost(pageUrl)) return {error: "private-host"};
+  const root = await fetchPublicDiscovery(pageUrl);
+  if (!root.ok) {
+    if (root.error === "protected") return {error: "protected", status: root.status};
+    if (root.error === "timeout") return {error: "timeout"};
+    if (root.error === "http" && root.status === 404) return {error: "notfound-http"};
+    if (root.error === "http" && root.status >= 500) return {error: "server", status: root.status};
+    if (root.error === "http" && root.status === 400) return {error: "badrequest"};
+    if (root.error === "http") return {error: "http", status: root.status};
+    if (root.error === "not-text") return {error: "nothtml", contentType: root.contentType};
+    if (root.error === "network") return {error: "network", detail: root.detail};
+    return {error: root.error || "network"};
   }
 
-  let html;
-  try {
-    html = await res.text();
-  } catch (e) {
-    return {error: "network", detail: String(e?.message || e)};
-  }
-  if (!html || !html.trim()) return {error: "empty"};
-  if (html.length > SCRAPE_MAX_HTML_CHARS) html = html.slice(0, SCRAPE_MAX_HTML_CHARS);
-
-  const candidates = extractMediaUrls(html, res.url || pageUrl);
-  if (!candidates.length) return {error: "notfound"};
-
-  return {ok: true, candidates};
+  const discovered = await discoverPublicMedia(root.url || pageUrl);
+  if (!discovered.candidates.length) return {error: "notfound", pagesScanned: discovered.pagesScanned};
+  return {
+    ok: true,
+    candidates: discovered.candidates,
+    pagesScanned: discovered.pagesScanned
+  };
 }
 
 function scrapeKeyboard(candidates) {
@@ -720,7 +815,7 @@ async function handleAdminText(msg, env) {
       return sendMessage(env, chatId, "❌ URL tidak valid. Format: /scrape https://...");
     }
 
-    await sendMessage(env, chatId, "🔍 Memindai halaman, mohon tunggu...");
+    await sendMessage(env, chatId, "🔍 Memindai halaman + player/video host publik, mohon tunggu...");
     const result = await scrapePage(target.toString());
 
     if (result.error === "timeout") return sendMessage(env, chatId, "⏱️ Permintaan ke halaman timeout. Coba lagi nanti.");
@@ -733,14 +828,16 @@ async function handleAdminText(msg, env) {
     if (result.error === "nothtml") return sendMessage(env, chatId, `ℹ️ Resource bukan halaman HTML yang dapat dipindai (content-type: ${result.contentType || "-"}).`);
     if (result.error === "empty") return sendMessage(env, chatId, "❌ Halaman kosong, tidak ada konten untuk dipindai.");
     if (result.error === "network") return sendMessage(env, chatId, `❌ Gagal mengakses URL: ${result.detail || "unknown error"}`);
-    if (result.error === "notfound") return sendMessage(env, chatId, "❌ Tidak ditemukan URL MP4/M3U8 publik pada halaman tersebut.");
+    if (result.error === "notfound") return sendMessage(env, chatId, `❌ Tidak ditemukan URL MP4/M3U8 publik.
+
+Scraper sudah memeriksa halaman utama dan player/iframe publik yang direferensikan (maks. ${SCRAPE_MAX_DISCOVERY_PAGES} resource, kedalaman ${SCRAPE_MAX_DISCOVERY_DEPTH}).`);
 
     const candidates = result.candidates.slice(0, SCRAPE_MAX_CANDIDATES);
     const truncated = result.candidates.length > SCRAPE_MAX_CANDIDATES;
     const state = {userId, mode: "scrape", chatId, candidates, createdAt: Date.now()};
     await putState(env, userId, state);
 
-    const lines = candidates.map((c, i) => `${i + 1}. 🎬 ${c.quality}\n   ${c.type}\n   ${c.url}`);
+    const lines = candidates.map((c, i) => `${i + 1}. 🎬 ${c.quality}\n   ${c.type}\n   ${c.url}\n   ↳ ${c.via === "iframe" ? "player/iframe publik" : "resource publik"}`);
     const extra = truncated ? `\n\n...ditemukan lebih banyak, hanya ${SCRAPE_MAX_CANDIDATES} kandidat pertama yang ditampilkan.` : "";
     await sendMessage(env, chatId, `🔎 Hasil Scrape (${candidates.length})\n\n${lines.join("\n\n")}${extra}`,
       {reply_markup: scrapeKeyboard(candidates)});

@@ -1438,7 +1438,7 @@ async function diagnostic(env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -1480,30 +1480,43 @@ export default {
 
     try {
       const update = await request.json();
-      await handleUpdate(update, env);
+
+      // Telegram webhook harus segera mendapat HTTP 200. Jangan menunggu
+      // scraper/player discovery selesai karena proses tersebut bisa memakan
+      // beberapa detik dan menyebabkan Telegram mengirim ulang update yang sama.
+      const task = Promise.resolve()
+        .then(() => handleUpdate(update, env))
+        .catch(async (e) => {
+          try {
+            const adminIds = String(env.ADMIN_IDS || "")
+              .split(",")
+              .map(x => x.trim())
+              .filter(Boolean);
+
+            const errorText =
+              `⚠️ WORKER ERROR\n\n` +
+              `${String(e?.message || e).slice(0,1200)}`;
+
+            for (const adminId of adminIds) {
+              try {
+                await sendMessage(env, adminId, errorText);
+              } catch (_) {}
+            }
+          } catch (_) {}
+        });
+
+      // Cloudflare Worker akan menjaga task tetap hidup setelah response
+      // dikirim, tanpa membuat Telegram menunggu seluruh proses scraper.
+      if (typeof request.cf !== "undefined") {
+        // no-op: hanya menjaga kompatibilitas dengan runtime Cloudflare.
+      }
+
+      if (ctx?.waitUntil) ctx.waitUntil(task);
+      else void task;
+
       return json({ok:true});
     } catch (e) {
-      try {
-        const adminIds = String(env.ADMIN_IDS || "")
-          .split(",")
-          .map(x => x.trim())
-          .filter(Boolean);
-
-        const errorText =
-          `⚠️ WORKER ERROR\n\n` +
-          `${String(e?.message || e).slice(0,1200)}`;
-
-        for (const adminId of adminIds) {
-          try {
-            await sendMessage(env, adminId, errorText);
-          } catch (_) {}
-        }
-      } catch (_) {}
-
-      return json({
-        ok: false,
-        error: "internal_error"
-      }, 500);
+      return json({ok:false,error:String(e?.message || e)},500);
     }
   }
 };

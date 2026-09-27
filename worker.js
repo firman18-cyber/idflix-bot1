@@ -5,7 +5,6 @@ const json = (data, status = 200) =>
   });
 
 const DB_URL = "https://idflix-219d7-default-rtdb.asia-southeast1.firebasedatabase.app";
-const TELEPLAY_DEFAULT_BASE_URL = "https://idflix-teleplay.killua.blitz.cloud";
 const OAUTH_URL = "https://oauth2.googleapis.com/token";
 const FB_SCOPE = "https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email";
 const QUALITIES = ["360p","480p","720p","1080p","1440p","2160p"];
@@ -196,73 +195,14 @@ async function findMovieByTitle(env, title) {
   return null;
 }
 
-
-function normalizeMovieTitle(title) {
-  return String(title || "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/[“”‘’]/g, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function findMovieByIdentity(env, title, year) {
-  const movies = await firebaseRequest(env, "GET", "movies") || {};
-  const target = normalizeMovieTitle(title);
-  const y = Number(year);
-  for (const [id, movie] of Object.entries(movies)) {
-    if (normalizeMovieTitle(movie?.title) === target && Number(movie?.year) === y) return {id, movie};
-  }
-  return null;
-}
-
-function buildTeleplayUrl(env, messageId) {
-  const base = String(env.TELEPLAY_BASE_URL || TELEPLAY_DEFAULT_BASE_URL).replace(/\/$/, "");
-  if (!base || !messageId) return "";
-  const u = new URL(`/stream/${encodeURIComponent(messageId)}`, base);
-  const token = String(env.TELEPLAY_STREAM_TOKEN || "").trim();
-  if (token) u.searchParams.set("token", token);
-  return u.toString();
-}
-
-function videoDocumentLooksLikeVideo(doc) {
-  const mime = String(doc?.mime_type || "").toLowerCase();
-  const name = String(doc?.file_name || "").toLowerCase();
-  return mime.startsWith("video/") || /\.(mp4|mkv|webm|mov|m4v|avi)$/i.test(name);
-}
-
-async function prepareTeleplaySource(msg, env) {
-  if (!env.IDFLIX_GROUP_ID) throw new Error("IDFLIX_GROUP_ID belum diatur.");
-  const storageChatId = String(env.IDFLIX_GROUP_ID);
-  let messageId = Number(msg.message_id);
-  if (String(msg.chat.id) !== storageChatId) {
-    const copied = await tg(env, "copyMessage", {
-      chat_id: storageChatId,
-      from_chat_id: msg.chat.id,
-      message_id: msg.message_id
-    });
-    if (!copied?.message_id) throw new Error("Telegram gagal menyalin video ke grup IDFLIX.");
-    messageId = Number(copied.message_id);
-  }
-  const media = msg.video || msg.document;
-  return {
-    provider: "teleplay",
-    messageId,
-    chatId: storageChatId,
-    fileName: media?.file_name || "",
-    videoUrl: buildTeleplayUrl(env, messageId)
-  };
-}
-
 function slugify(s) {
   const x = String(s).normalize("NFKD").replace(/[\u0300-\u036f]/g,"")
     .toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"");
   return x || `film-${Date.now()}`;
 }
 
-async function uniqueMovieId(env, title, year) {
-  const base = `${slugify(title)}-${Number(year) || "unknown"}`;
+async function uniqueMovieId(env, title) {
+  const base = slugify(title);
   const exists = await getMovie(env, base);
   return exists ? `${base}-${Date.now().toString(36)}` : base;
 }
@@ -676,24 +616,18 @@ function addQualityKeyboard() {
 }
 
 function formatSummary(s) {
-  const source = s.videoProvider === "teleplay"
-    ? `🎬 Teleplay
-Message ID: ${s.telegramMessageId || "-"}`
-    : `🔗 URL
-${s.videoUrl || "-"}`;
   return `🎬 KONFIRMASI FILM
 
 Judul: ${s.title}
 Kualitas: ${s.quality}
 Tahun: ${s.year || "-"}
 Genre: ${(s.genre || []).join(", ") || "-"}
-Rating: ${s.rating ?? "-"}
+Rating: ${s.rating || "-"}
 Durasi: ${s.duration || "-"}
 Deskripsi: ${s.description || "-"}
 
-${source}
-🖼️ Poster: ${s.posterFileId ? "tersimpan" : "-"}
-🖼️ Backdrop: ${s.backdropFileId ? "tersimpan" : "-"}`;
+🔗 Video URL: ${s.videoUrl}
+🖼️ Poster: ${s.posterFileId ? "tersimpan (dari Telegram)" : "-"}`;
 }
 
 async function askNext(env, state, chatId) {
@@ -745,33 +679,20 @@ async function askNext(env, state, chatId) {
 }
 
 
-async function startMediaInput(msg, env, input) {
-  const userId = String(msg.from.id), chatId = msg.chat.id;
-  const state = {
-    userId, mode:"media_add", chatId, createdAt:Date.now(),
-    videoProvider:input.provider, videoUrl:input.videoUrl || "",
-    telegramMessageId:input.messageId || null, telegramChatId:input.chatId || null,
-    sourceFileName:input.fileName || ""
-  };
-  await putState(env, userId, state);
-  await sendMessage(env, chatId,
-    input.provider === "teleplay"
-      ? "🎬 Video diterima dan siap digunakan melalui Teleplay.\n\n🎞️ Pilih kualitas video:"
-      : "🔗 URL video diterima.\n\n🎞️ Pilih kualitas video:",
-    {reply_markup:qualityKeyboard()});
+function artworkTypeKeyboard() {
+  return {inline_keyboard:[
+    [
+      {text:"🖼️ Poster", callback_data:"art_type:poster"},
+      {text:"🌄 Backdrop", callback_data:"art_type:backdrop"}
+    ],
+    [{text:"❌ Batal", callback_data:"cancel"}]
+  ]};
 }
 
-async function handleAdminMedia(msg, env) {
-  if (msg.video || videoDocumentLooksLikeVideo(msg.document)) {
-    await startMediaInput(msg, env, await prepareTeleplaySource(msg, env));
-    return true;
-  }
-  const text = String(msg.text || "").trim();
-  if (isValidVideoUrl(text)) {
-    await startMediaInput(msg, env, {provider:"custom", videoUrl:text});
-    return true;
-  }
-  return false;
+function artworkSummary(state) {
+  return `🖼️ Artwork diterima.\n\n` +
+    `Jenis: ${state.artworkType === "backdrop" ? "🌄 Backdrop" : "🖼️ Poster"}\n\n` +
+    `🎬 Masukkan judul film:`;
 }
 
 async function handleAdminText(msg, env) {
@@ -779,42 +700,39 @@ async function handleAdminText(msg, env) {
   const chatId = msg.chat.id;
   const text = String(msg.text || "").trim();
 
+  // Artwork untuk mode /simpan. Poster/backdrop dapat disimpan tanpa video.
   if (Array.isArray(msg.photo) && msg.photo.length) {
     const largest = msg.photo[msg.photo.length - 1];
     const active = await getState(env, userId);
-    if (active?.mode === "media_add" || active?.mode === "simpan") {
-      if (active.movieId) {
-        await firebaseRequest(env, "PATCH", `movies/${active.movieId}`, {posterFileId:largest.file_id});
-      } else {
-        active.posterFileId = largest.file_id;
-        await putState(env,userId,active);
-      }
-      await sendMessage(env, chatId, "✅ Poster ditambahkan ke proses film ini.");
-      return;
-    }
-    if (active?.step === "await_poster" || active?.step === "await_backdrop") {
-      const wasPoster = active.step === "await_poster";
-      const movie = active.movieId ? await getMovie(env, active.movieId) : null;
-      if (movie) {
-        const patch = wasPoster ? {posterFileId:largest.file_id} : {backdropFileId:largest.file_id, backdrop:largest.file_id};
-        await firebaseRequest(env, "PATCH", `movies/${active.movieId}`, patch);
-        delete active.step;
-        await putState(env,userId,active);
-        await sendMessage(env, chatId, `✅ ${wasPoster ? "Poster" : "Backdrop"} berhasil ditambahkan ke ${movie.title}.
 
-Masih bisa menambahkan artwork lain:`, {reply_markup:{inline_keyboard:[
-          [{text:wasPoster?"🖼️ Tambah Backdrop":"📷 Tambah Poster",callback_data:wasPoster?"media_backdrop_existing":"media_poster_existing"}],
-          [{text:"✅ Selesai",callback_data:"media_done"}],
-          [{text:"❌ Batal",callback_data:"cancel"}]
-        ]}});
+    if (active?.mode === "artwork_save") {
+      active.artworkFileId = largest.file_id;
+      active.artworkWidth = Number(largest.width || 0);
+      active.artworkHeight = Number(largest.height || 0);
+
+      // Jika orientasi jelas, langsung tentukan jenis artwork.
+      if (active.artworkWidth > active.artworkHeight && active.artworkWidth > 0) {
+        active.artworkType = "backdrop";
+      } else if (active.artworkHeight > active.artworkWidth && active.artworkHeight > 0) {
+        active.artworkType = "poster";
+      }
+
+      if (!active.artworkType) {
+        active.step = "await_artwork_type";
+        await putState(env, userId, active);
+        await sendMessage(env, chatId, "🖼️ Gambar diterima. Pilih jenis artwork:", {reply_markup:artworkTypeKeyboard()});
       } else {
-        await putLastPoster(env,userId,largest.file_id);
-        await sendMessage(env,chatId,"✅ Gambar diterima dan disimpan sementara.");
+        active.step = "await_artwork_title";
+        await putState(env, userId, active);
+        await sendMessage(env, chatId, artworkSummary(active));
       }
       return;
     }
-    await putLastPoster(env,userId,largest.file_id);
-    await sendMessage(env, chatId, "🖼️ Poster diterima dan disimpan sementara.");
+
+    // Backward-compatible: jika foto dikirim tanpa /simpan, tetap simpan sebagai
+    // poster terakhir untuk flow lama.
+    await putLastPoster(env, userId, largest.file_id);
+    await sendMessage(env, chatId, "🖼️ Poster diterima dan disimpan sementara.\n\nGunakan /simpan untuk menyimpan artwork film.");
     return;
   }
 
@@ -862,11 +780,6 @@ Masih bisa menambahkan artwork lain:`, {reply_markup:{inline_keyboard:[
     return;
   }
 
-  if (msg.video || videoDocumentLooksLikeVideo(msg.document) || isValidVideoUrl(text)) {
-    await handleAdminMedia(msg, env);
-    return;
-  }
-
   if (text === "/id") {
     await sendMessage(env, chatId, `Telegram ID kamu: ${msg.from.id}`);
     return;
@@ -877,7 +790,6 @@ Masih bisa menambahkan artwork lain:`, {reply_markup:{inline_keyboard:[
       "1. Upload poster film (gambar)\n" +
       "2. /simpan <judul> — tambah film baru\n" +
       "3. /tambah <judul> — tambah kualitas video ke film yang sudah ada\n\n" +
-      "/scrape <url> — cari URL MP4/M3U8 publik dari halaman\n" +
       "/subtitle <judul> — upload subtitle .srt/.vtt untuk film\n" +
       "/list — daftar film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
     return;
@@ -910,17 +822,25 @@ Masih bisa menambahkan artwork lain:`, {reply_markup:{inline_keyboard:[
     return;
   }
 
+  if (text === "/simpan") {
+    const state = {userId, mode:"artwork_save", step:"await_artwork", createdAt:Date.now(), chatId};
+    await putState(env, userId, state);
+    await sendMessage(env, chatId,
+      "🖼️ MODE SIMPAN ARTWORK\n\nKirim gambar poster atau backdrop film.\n\nSetelah gambar diterima, bot akan meminta judul dan tahun.\n\nVideo bisa ditambahkan nanti melalui alur video/Teleplay.");
+    return;
+  }
+
   if (text.startsWith("/simpan ")) {
     const title = text.slice(8).trim();
     if (!title) return sendMessage(env, chatId, "Format: /simpan <judul>");
     const posterFileId = await getLastPoster(env, userId);
     if (!posterFileId) {
-      await sendMessage(env, chatId, "⚠️ Kirim poster film terlebih dahulu (upload gambar), lalu jalankan /simpan <judul> lagi.");
+      await sendMessage(env, chatId, "⚠️ Untuk flow lama, kirim poster terlebih dahulu. Atau gunakan /simpan untuk mode artwork baru.");
       return;
     }
     const state = {userId, mode:"simpan", title, posterFileId, createdAt:Date.now(), chatId};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Judul: ${title}\n🖼️ Poster: tersimpan\n\n🔗 Kirim link video Dosya.at atau hosting lain (harus diawali https://)`);
+    await sendMessage(env, chatId, `🎬 Judul: ${title}\n🖼️ Poster: tersimpan\n\n🎞️ Untuk menambahkan video gunakan alur video/Teleplay, bukan link di sini.`);
     return;
   }
 
@@ -932,46 +852,6 @@ Masih bisa menambahkan artwork lain:`, {reply_markup:{inline_keyboard:[
     const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId};
     await putState(env, userId, state);
     await sendMessage(env, chatId, `🎬 Film ditemukan: ${found.movie.title}\n\n🔗 Kirim link video kualitas tambahan (harus diawali https://)`);
-    return;
-  }
-
-  if (text.startsWith("/scrape ")) {
-    const raw = text.slice(8).trim();
-    if (!raw) return sendMessage(env, chatId, "Format: /scrape <URL>");
-    let target;
-    try {
-      target = new URL(raw);
-      if (!/^https?:$/.test(target.protocol)) throw new Error("bad-protocol");
-    } catch {
-      return sendMessage(env, chatId, "❌ URL tidak valid. Format: /scrape https://...");
-    }
-
-    await sendMessage(env, chatId, "🔍 Memindai halaman + player/video host publik, mohon tunggu...");
-    const result = await scrapePage(target.toString());
-
-    if (result.error === "timeout") return sendMessage(env, chatId, "⏱️ Permintaan ke halaman timeout. Coba lagi nanti.");
-    if (result.error === "protected") return sendMessage(env, chatId,
-      `⚠️ Halaman tidak dapat diakses sebagai resource publik (status ${result.status}).\n\nScraper tidak melakukan bypass login/CAPTCHA/DRM/anti-bot.`);
-    if (result.error === "notfound-http") return sendMessage(env, chatId, "❌ Halaman tidak ditemukan (404).");
-    if (result.error === "server") return sendMessage(env, chatId, `❌ Server halaman mengalami error (status ${result.status}). Coba lagi nanti.`);
-    if (result.error === "badrequest") return sendMessage(env, chatId, "❌ Permintaan tidak valid (400). Periksa kembali URL.");
-    if (result.error === "http") return sendMessage(env, chatId, `❌ Gagal mengambil halaman (status ${result.status}).`);
-    if (result.error === "nothtml") return sendMessage(env, chatId, `ℹ️ Resource bukan halaman HTML yang dapat dipindai (content-type: ${result.contentType || "-"}).`);
-    if (result.error === "empty") return sendMessage(env, chatId, "❌ Halaman kosong, tidak ada konten untuk dipindai.");
-    if (result.error === "network") return sendMessage(env, chatId, `❌ Gagal mengakses URL: ${result.detail || "unknown error"}`);
-    if (result.error === "notfound") return sendMessage(env, chatId, `❌ Tidak ditemukan URL MP4/M3U8 publik.
-
-Scraper sudah memeriksa halaman utama dan player/iframe publik yang direferensikan (maks. ${SCRAPE_MAX_DISCOVERY_PAGES} resource, kedalaman ${SCRAPE_MAX_DISCOVERY_DEPTH}).`);
-
-    const candidates = result.candidates.slice(0, SCRAPE_MAX_CANDIDATES);
-    const truncated = result.candidates.length > SCRAPE_MAX_CANDIDATES;
-    const state = {userId, mode: "scrape", chatId, candidates, createdAt: Date.now()};
-    await putState(env, userId, state);
-
-    const lines = candidates.map((c, i) => `${i + 1}. 🎬 ${c.quality}\n   ${c.type}\n   ${c.url}\n   ↳ ${c.via === "iframe" ? "player/iframe publik" : "resource publik"}`);
-    const extra = truncated ? `\n\n...ditemukan lebih banyak, hanya ${SCRAPE_MAX_CANDIDATES} kandidat pertama yang ditampilkan.` : "";
-    await sendMessage(env, chatId, `🔎 Hasil Scrape (${candidates.length})\n\n${lines.join("\n\n")}${extra}`,
-      {reply_markup: scrapeKeyboard(candidates)});
     return;
   }
 
@@ -998,54 +878,67 @@ Scraper sudah memeriksa halaman utama dan player/iframe publik yang direferensik
   const state = await getState(env, userId);
   if (!state) return;
 
-  if (!text) return; // abaikan pesan non-teks lain di luar flow yang dikenal
-
-  if (state.mode === "media_add") {
-    if (state.step === "await_title") {
-      state.title = text; state.step = "await_year";
-      await putState(env, userId, state);
-      await sendMessage(env, chatId, "📅 Masukkan tahun film, contoh: 2022");
-      return;
-    }
-    if (state.step === "await_year") {
-      if (!/^\d{4}$/.test(text)) return sendMessage(env, chatId, "❌ Tahun harus 4 digit, contoh: 2022.");
-      state.year = Number(text);
-      const found = await findMovieByIdentity(env, state.title, state.year);
-      if (found) {
-        state.movieId = found.id; state.movieTitle = found.movie.title;
-        const exists = !!migratedVideos(found.movie)[state.quality];
-        await putState(env, userId, state);
-        await sendMessage(env, chatId,
-          exists
-            ? `⚠️ ${found.movie.title} (${state.year}) sudah memiliki ${state.quality}.\n\nProvider lama: ${migratedVideos(found.movie)[state.quality]?.provider || "custom"}\nProvider baru: ${state.videoProvider}\n\nPilih tindakan:`
-            : `🎬 Film ditemukan: ${found.movie.title} (${state.year})\n\nQuality: ${state.quality}\nProvider: ${state.videoProvider}\n\nTambahkan ke film ini?`,
-          {reply_markup:{inline_keyboard: exists
-            ? [[{text:"♻️ Overwrite",callback_data:"media_overwrite"}],[{text:"❌ Batal",callback_data:"cancel"}]]
-            : [[{text:"✅ Tambahkan",callback_data:"media_add_existing"}],[{text:"📷 Tambah Poster",callback_data:"media_poster_existing"}],[{text:"🖼️ Tambah Backdrop",callback_data:"media_backdrop_existing"}],[{text:"❌ Batal",callback_data:"cancel"}]]}});
-      } else {
-        state.step = "new_movie_metadata"; state.genre = [];
-        await putState(env, userId, state);
-        await sendMessage(env, chatId, `🆕 Film baru: ${state.title} (${state.year})\n\n⭐ Masukkan rating, contoh: 8.5`);
-      }
-      return;
-    }
-    if (state.step === "new_movie_metadata") {
-      if (state.rating === undefined) {
-        const n = Number(text.replace(",", "."));
-        if (!Number.isFinite(n) || n < 0 || n > 10) return sendMessage(env, chatId, "❌ Rating harus angka 0–10.");
-        state.rating=n; await putState(env,userId,state); await sendMessage(env,chatId,"⏱️ Masukkan durasi, contoh: 2j 10m"); return;
-      }
-      if (!state.duration) { state.duration=text; await putState(env,userId,state); await sendMessage(env,chatId,"📝 Masukkan deskripsi film."); return; }
-      if (!state.description) {
-        state.description=text;
-        state.mode="simpan";
-        delete state.step;
-        await putState(env,userId,state);
-        await sendMessage(env,chatId,"🎭 Pilih genre film:",{reply_markup:genreKeyboard([])});
-        return;
-      }
-    }
+  if (state.mode === "artwork_save" && state.step === "await_artwork_title") {
+    if (!text) return;
+    state.title = text;
+    state.step = "await_artwork_year";
+    await putState(env, userId, state);
+    await sendMessage(env, chatId, "📅 Masukkan tahun film, contoh: 2026");
+    return;
   }
+
+  if (state.mode === "artwork_save" && state.step === "await_artwork_year") {
+    if (!/^\d{4}$/.test(text)) {
+      await sendMessage(env, chatId, "❌ Tahun harus 4 digit, contoh: 2026.");
+      return;
+    }
+
+    state.year = Number(text);
+    const found = await findMovieByIdentity(env, state.title, state.year);
+
+    if (found) {
+      const patch = state.artworkType === "backdrop"
+        ? {backdropFileId: state.artworkFileId}
+        : {posterFileId: state.artworkFileId};
+
+      await firebaseRequest(env, "PATCH", `movies/${found.id}`, patch);
+      await delState(env, userId);
+
+      await sendMessage(env, chatId,
+        `✅ ${state.artworkType === "backdrop" ? "Backdrop" : "Poster"} berhasil disimpan.\n\n` +
+        `🎬 Judul: ${found.movie.title}\n📅 Tahun: ${found.movie.year}\n🆔 ID: ${found.id}`);
+      return;
+    }
+
+    const id = await uniqueMovieId(env, state.title);
+    const movie = {
+      type: "movie",
+      title: state.title,
+      year: state.year,
+      genre: [],
+      rating: 0,
+      duration: "",
+      description: "",
+      posterFileId: state.artworkType === "poster" ? state.artworkFileId : "",
+      backdropFileId: state.artworkType === "backdrop" ? state.artworkFileId : "",
+      backdrop: "",
+      videos: {},
+      videoUrl: "",
+      quality: "",
+      addedAt: Date.now()
+    };
+
+    await firebaseRequest(env, "PUT", `movies/${id}`, movie);
+    await delState(env, userId);
+
+    await sendMessage(env, chatId,
+      `✅ FILM BERHASIL DISIMPAN\n\n` +
+      `🎬 Judul: ${state.title}\n📅 Tahun: ${state.year}\n🆔 ID: ${id}\n` +
+      `${state.artworkType === "backdrop" ? "🌄 Backdrop" : "🖼️ Poster"}: tersimpan di Telegram`);
+    return;
+  }
+
+  if (!text) return; // abaikan pesan non-teks lain di luar flow yang dikenal
 
   if (state.mode === "scrape" && state.step === "await_title") {
     const title = text.trim();
@@ -1131,16 +1024,26 @@ async function handleCallback(q, env) {
     return;
   }
 
-  if (data.startsWith("q:")) {
-    const chosen = data.slice(2);
-
-    if (state.mode === "media_add") {
-      state.quality = chosen; state.step = "await_title";
-      await putState(env,userId,state);
-      await answerCallback(env,q.id,`Kualitas ${chosen}`);
-      await editMessage(env,chatId,msg.message_id,`✅ Kualitas: ${chosen}\n\nMasukkan judul film:`);
+  if (data.startsWith("art_type:")) {
+    if (state.mode !== "artwork_save" || !state.artworkFileId) {
+      await answerCallback(env, q.id, "Artwork belum diterima.");
       return;
     }
+    const type = data.slice(9);
+    if (type !== "poster" && type !== "backdrop") {
+      await answerCallback(env, q.id, "Jenis artwork tidak valid.");
+      return;
+    }
+    state.artworkType = type;
+    state.step = "await_artwork_title";
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, type === "poster" ? "Poster dipilih" : "Backdrop dipilih");
+    await editMessage(env, chatId, msg.message_id, artworkSummary(state));
+    return;
+  }
+
+  if (data.startsWith("q:")) {
+    const chosen = data.slice(2);
 
     if (state.mode === "tambah" && state.movieId) {
       const movie = await getMovie(env, state.movieId);
@@ -1199,17 +1102,21 @@ async function handleCallback(q, env) {
       return answerCallback(env, q.id, "Data belum lengkap.");
     }
     await answerCallback(env, q.id, "Menyimpan film...");
-    const id = await uniqueMovieId(env, state.title, state.year);
-    const videoEntry = state.videoProvider === "teleplay"
-      ? {provider:"teleplay", messageId:Number(state.telegramMessageId), chatId:String(state.telegramChatId || env.IDFLIX_GROUP_ID), videoUrl:state.videoUrl || buildTeleplayUrl(env,state.telegramMessageId)}
-      : {videoUrl:state.videoUrl, provider:"custom"};
+    const id = await uniqueMovieId(env, state.title);
     const movie = {
-      type:"movie", title:state.title, year:state.year, genre:state.genre,
-      rating:Number(state.rating), duration:state.duration, description:state.description,
-      posterFileId:state.posterFileId || "", backdropFileId:state.backdropFileId || "",
-      backdrop:state.backdropFileId || "", videos:{[state.quality]:videoEntry},
-      videoUrl:videoEntry.videoUrl || "", quality:state.quality, provider:videoEntry.provider,
-      addedAt:Date.now()
+      type: "movie",
+      title: state.title,
+      year: state.year,
+      genre: state.genre,
+      rating: Number(state.rating),
+      duration: state.duration,
+      description: state.description,
+      posterFileId: state.posterFileId || "",
+      backdrop: "",
+      videos: {[state.quality]: {videoUrl: state.videoUrl, provider: "custom"}},
+      videoUrl: state.videoUrl,
+      quality: state.quality,
+      addedAt: Date.now()
     };
     await firebaseRequest(env, "PUT", `movies/${id}`, movie);
     await delState(env, userId);
@@ -1381,50 +1288,6 @@ async function handleCallback(q, env) {
     await answerCallback(env, q.id, `Kualitas ${quality}`);
     await editMessage(env, chatId, msg.message_id,
       `📄 Silakan kirim file subtitle untuk ${state.movieTitle} (${quality}).\n\nFormat:\n• .srt\n• .vtt\n\nBahasa default: Indonesia`);
-    return;
-  }
-
-  if (data === "media_add_existing" || data === "media_overwrite") {
-    if (state.mode !== "media_add" || !state.movieId || !state.quality) return answerCallback(env,q.id,"Data belum lengkap.");
-    const movie = await getMovie(env,state.movieId); if (!movie) return answerCallback(env,q.id,"Film tidak ditemukan.");
-    const videos = migratedVideos(movie);
-    if (data === "media_add_existing" && videos[state.quality]) return answerCallback(env,q.id,"Quality sudah ada.");
-    if (data === "media_overwrite" && !videos[state.quality]) return answerCallback(env,q.id,"Quality belum ada.");
-    const entry = {...(videos[state.quality] || {})};
-    if (state.videoProvider === "teleplay") {
-      entry.provider="teleplay"; entry.messageId=Number(state.telegramMessageId); entry.chatId=String(state.telegramChatId || env.IDFLIX_GROUP_ID); entry.videoUrl=state.videoUrl || buildTeleplayUrl(env,state.telegramMessageId);
-    } else { entry.provider="custom"; entry.videoUrl=state.videoUrl; }
-    videos[state.quality]=entry;
-    const patch={videos};
-    if (!movie.videoUrl && entry.videoUrl) { patch.videoUrl=entry.videoUrl; patch.quality=state.quality; patch.provider=entry.provider; }
-    await firebaseRequest(env,"PATCH",`movies/${state.movieId}`,patch);
-    await answerCallback(env,q.id,data === "media_overwrite" ? "Di-overwrite" : "Ditambahkan");
-    await editMessage(env,chatId,msg.message_id,`✅ ${state.quality} ${data === "media_overwrite" ? "berhasil diperbarui" : "berhasil ditambahkan"} ke ${movie.title}.
-Provider: ${entry.provider}
-
-Poster/backdrop dapat ditambahkan sekarang:`,{reply_markup:{inline_keyboard:[
-      [{text:"📷 Tambah Poster",callback_data:"media_poster_existing"}],
-      [{text:"🖼️ Tambah Backdrop",callback_data:"media_backdrop_existing"}],
-      [{text:"✅ Selesai",callback_data:"media_done"}],
-      [{text:"❌ Batal",callback_data:"cancel"}]
-    ]}});
-    return;
-  }
-
-  if (data === "media_done") {
-    if (state.mode !== "media_add") return answerCallback(env,q.id,"Sesi tidak valid.");
-    await delState(env,userId);
-    await answerCallback(env,q.id,"Selesai");
-    await editMessage(env,chatId,msg.message_id,"✅ Proses selesai.");
-    return;
-  }
-
-  if (data === "media_poster_existing" || data === "media_backdrop_existing") {
-    if (state.mode !== "media_add" || !state.movieId) return answerCallback(env,q.id,"Data belum lengkap.");
-    state.step = data === "media_poster_existing" ? "await_poster" : "await_backdrop";
-    await putState(env,userId,state);
-    await answerCallback(env,q.id,data === "media_poster_existing" ? "Kirim poster" : "Kirim backdrop");
-    await editMessage(env,chatId,msg.message_id,data === "media_poster_existing" ? "📷 Kirim poster film." : "🖼️ Kirim backdrop landscape film.");
     return;
   }
 

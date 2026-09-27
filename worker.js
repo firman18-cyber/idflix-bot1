@@ -371,7 +371,7 @@ async function askNext(env, state, chatId) {
       await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
       return;
     }
-    if (state.sourceType === "upload" && !state.videoUrl) {
+    if (state.sourceType === "upload" && !state.videoMessageId) {
       await sendMessage(env, chatId, "🎥 Kirim video Telegram sekarang.");
       return;
     }
@@ -411,7 +411,7 @@ async function askNext(env, state, chatId) {
       await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
       return;
     }
-    if (state.sourceType === "upload" && !state.videoUrl) {
+    if (state.sourceType === "upload" && !state.videoMessageId) {
       await sendMessage(env, chatId, "🎥 Kirim video Telegram sekarang.");
       return;
     }
@@ -523,8 +523,10 @@ async function handleAdminText(msg, env) {
   if ((msg.video || isVideoDocument) &&
       (stateForVideo?.mode === "simpan" || stateForVideo?.mode === "tambah") &&
       stateForVideo.sourceType === "upload" &&
-      !stateForVideo.videoUrl) {
-    await storeUploadedVideo(env, msg, stateForVideo, chatId);
+      stateForVideo.step === "await_video_upload" &&
+      !stateForVideo.videoMessageId) {
+    const stored = await storeUploadedVideo(env, msg, stateForVideo, chatId);
+    if (stored) return;
     return;
   }
 
@@ -706,7 +708,10 @@ async function handleAdminText(msg, env) {
     return;
   }
 
-  if ((state.mode === "simpan" || state.mode === "tambah") && state.sourceType === "link" && !state.videoUrl) {
+  if ((state.mode === "simpan" || state.mode === "tambah") &&
+      state.sourceType === "link" &&
+      state.step === "await_video_url" &&
+      !state.videoUrl) {
     if (!isValidVideoUrl(text)) {
       await sendMessage(env, chatId, "❌ URL tidak valid. URL harus diawali https:// dan berupa link yang valid.\n\n🔗 Kirim link video.");
       return;

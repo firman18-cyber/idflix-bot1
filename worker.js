@@ -430,7 +430,7 @@ async function askNext(env, state, chatId) {
 }
 
 function buildTeleplayVideoUrl(env, messageId) {
-  const base = String(env.TELEPLAY_BASE_URL || "").trim().replace(/\/+$/, "");
+  const base = String(env.TELEPLAY_BASE_URL || "https://idflix-teleplay.killua.blitz.cloud").trim().replace(/\/+$/, "");
   const token = String(env.TELEPLAY_STREAM_TOKEN || "").trim();
   if (!base || !messageId) return "";
   const url = `${base}/stream/${encodeURIComponent(String(messageId))}`;
@@ -438,12 +438,13 @@ function buildTeleplayVideoUrl(env, messageId) {
 }
 
 async function storeUploadedVideo(env, msg, state, chatId) {
-  if (!env.IDFLIX_GROUP_ID) {
-    await sendMessage(env, chatId, "❌ IDFLIX_GROUP_ID belum dikonfigurasi untuk penyimpanan video.");
+  if (!env.TELEGRAM_CHAT_ID) {
+    await sendMessage(env, chatId, "❌ TELEGRAM_CHAT_ID belum dikonfigurasi untuk penyimpanan video.");
     return false;
   }
-  if (!env.TELEPLAY_BASE_URL) {
-    await sendMessage(env, chatId, "❌ TELEPLAY_BASE_URL belum dikonfigurasi.");
+
+  if (!env.TELEPLAY_STREAM_TOKEN) {
+    await sendMessage(env, chatId, "❌ TELEPLAY_STREAM_TOKEN belum dikonfigurasi.");
     return false;
   }
 
@@ -452,7 +453,7 @@ async function storeUploadedVideo(env, msg, state, chatId) {
     // message_id hasil copy tersebut melalui MTProto, jadi Worker tidak
     // pernah mengunduh file video ke memory/filesystem.
     const copied = await tg(env, "copyMessage", {
-      chat_id: env.IDFLIX_GROUP_ID,
+      chat_id: env.TELEGRAM_CHAT_ID,
       from_chat_id: msg.chat.id,
       message_id: msg.message_id
     });
@@ -893,14 +894,14 @@ async function handleCallback(q, env) {
     await delState(env, userId);
 
     const lines = [];
-    if (env.IDFLIX_GROUP_ID && env.TOPIC_KV) {
+    if (env.TELEGRAM_CHAT_ID && env.TOPIC_KV) {
       for (const genre of state.genre) {
         const key = `genre:${slugify(genre)}`;
         let threadId = await env.TOPIC_KV.get(key);
         if (!threadId) {
           try {
             const topic = await tg(env, "createForumTopic", {
-              chat_id:env.IDFLIX_GROUP_ID,
+              chat_id:env.TELEGRAM_CHAT_ID,
               name:genre
             });
             threadId = topic ? String(topic.message_thread_id) : null;
@@ -915,12 +916,12 @@ async function handleCallback(q, env) {
     await sendMessage(env, chatId,
       `✅ FILM BERHASIL DISIMPAN\n\n🎬 Judul: ${state.title}\n🆔 ID: ${id}\n🎞️ Kualitas: ${state.quality}\n📂 Genre: ${state.genre.join(", ")}\n🔗 Video: ${state.videoUrl}\n🖼️ Poster: tersimpan di Telegram (posterFileId)`);
 
-    if (env.IDFLIX_GROUP_ID) {
+    if (env.TELEGRAM_CHAT_ID) {
       for (const genre of state.genre) {
         const threadId = await env.TOPIC_KV?.get(`genre:${slugify(genre)}`);
         if (threadId) {
           try {
-            await sendMessage(env, env.IDFLIX_GROUP_ID,
+            await sendMessage(env, env.TELEGRAM_CHAT_ID,
               `🎬 ${state.title}\n🎞️ ${state.quality}\n⭐ ${state.rating}\n📅 ${state.year}`,
               {message_thread_id:Number(threadId)});
           } catch {}
@@ -1171,7 +1172,7 @@ async function diagnostic(env) {
   const envInfo = {
     BOT_TOKEN: !!env.BOT_TOKEN,
     ADMIN_IDS: !!env.ADMIN_IDS,
-    IDFLIX_GROUP_ID: !!env.IDFLIX_GROUP_ID,
+    TELEGRAM_CHAT_ID: !!env.TELEGRAM_CHAT_ID,
     TOPIC_KV: !!env.TOPIC_KV,
     FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
     FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY

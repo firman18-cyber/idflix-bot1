@@ -371,6 +371,10 @@ async function askNext(env, state, chatId) {
       await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
       return;
     }
+    if (state.sourceType === "upload" && !state.videoUrl) {
+      await sendMessage(env, chatId, "🎥 Kirim video Telegram sekarang.");
+      return;
+    }
     if (!state.sourceType) {
       await sendMessage(env, chatId, "🎬 Pilih sumber video:", {reply_markup:videoSourceKeyboard("simpan")});
       return;
@@ -407,6 +411,10 @@ async function askNext(env, state, chatId) {
       await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
       return;
     }
+    if (state.sourceType === "upload" && !state.videoUrl) {
+      await sendMessage(env, chatId, "🎥 Kirim video Telegram sekarang.");
+      return;
+    }
     if (!state.sourceType) {
       await sendMessage(env, chatId, "🎬 Pilih sumber video:", {reply_markup:videoSourceKeyboard("tambah")});
       return;
@@ -418,6 +426,56 @@ async function askNext(env, state, chatId) {
     await sendMessage(env, chatId,
       `🎬 ${state.title}\n\nKualitas: ${state.quality}\n🔗 URL: ${state.videoUrl}\n\nKlik SIMPAN untuk menambahkan kualitas ini.`,
       {reply_markup:addQualityKeyboard()});
+  }
+}
+
+function buildTeleplayVideoUrl(env, messageId) {
+  const base = String(env.TELEPLAY_BASE_URL || "").trim().replace(/\/+$/, "");
+  const token = String(env.TELEPLAY_STREAM_TOKEN || "").trim();
+  if (!base || !messageId) return "";
+  const url = `${base}/stream/${encodeURIComponent(String(messageId))}`;
+  return token ? `${url}?token=${encodeURIComponent(token)}` : url;
+}
+
+async function storeUploadedVideo(env, msg, state, chatId) {
+  if (!env.IDFLIX_GROUP_ID) {
+    await sendMessage(env, chatId, "❌ IDFLIX_GROUP_ID belum dikonfigurasi untuk penyimpanan video.");
+    return false;
+  }
+  if (!env.TELEPLAY_BASE_URL) {
+    await sendMessage(env, chatId, "❌ TELEPLAY_BASE_URL belum dikonfigurasi.");
+    return false;
+  }
+
+  try {
+    // Salin media Telegram ke group storage. Teleplay mengambil media dari
+    // message_id hasil copy tersebut melalui MTProto, jadi Worker tidak
+    // pernah mengunduh file video ke memory/filesystem.
+    const copied = await tg(env, "copyMessage", {
+      chat_id: env.IDFLIX_GROUP_ID,
+      from_chat_id: msg.chat.id,
+      message_id: msg.message_id
+    });
+    const messageId = copied?.message_id;
+    const videoUrl = buildTeleplayVideoUrl(env, messageId);
+    if (!messageId || !videoUrl) {
+      throw new Error("copyMessage tidak mengembalikan message_id Teleplay.");
+    }
+
+    state.videoMessageId = messageId;
+    state.videoProvider = "teleplay";
+    state.videoUrl = videoUrl;
+    state.step = "await_quality";
+    await putState(env, state.userId, state);
+
+    await sendMessage(env, chatId,
+      `✅ Video berhasil disimpan ke Teleplay.\n\n🎞️ Sekarang pilih kualitas video:`,
+      {reply_markup:qualityKeyboard()}
+    );
+    return true;
+  } catch (e) {
+    await sendMessage(env, chatId, `❌ Gagal menyimpan video ke Teleplay.\n\n${String(e?.message || e).slice(0, 500)}\n\nKirim ulang video untuk mencoba lagi.`);
+    return false;
   }
 }
 
@@ -455,6 +513,18 @@ async function handleAdminText(msg, env) {
     const largest = msg.photo[msg.photo.length - 1];
     await putLastPoster(env, userId, largest.file_id);
     await sendMessage(env, chatId, "🖼️ Poster diterima dan disimpan sementara.\n\nGunakan /simpan <judul> untuk melanjutkan.");
+    return;
+  }
+
+  // Upload video untuk /simpan atau /tambah. Video langsung dicopy ke
+  // group storage lalu URL streaming Teleplay disimpan di state.
+  const stateForVideo = await getState(env, userId);
+  const isVideoDocument = !!msg.document && String(msg.document.mime_type || "").toLowerCase().startsWith("video/");
+  if ((msg.video || isVideoDocument) &&
+      (stateForVideo?.mode === "simpan" || stateForVideo?.mode === "tambah") &&
+      stateForVideo.sourceType === "upload" &&
+      !stateForVideo.videoUrl) {
+    await storeUploadedVideo(env, msg, stateForVideo, chatId);
     return;
   }
 
@@ -699,21 +769,24 @@ async function handleCallback(q, env) {
       return answerCallback(env, q.id, "Sesi sumber video tidak valid.");
     }
 
-    if (sourceType !== "link") {
-      await answerCallback(env, q.id, "Alur upload video belum diaktifkan pada patch ini.");
-      return;
+    if (sourceType !== "link" && sourceType !== "upload") {
+      return answerCallback(env, q.id, "Sumber video tidak valid.");
     }
 
-    state.sourceType = "link";
-    state.step = "await_video_url";
+    state.sourceType = sourceType;
+    state.step = sourceType === "upload" ? "await_video_upload" : "await_video_url";
     delete state.videoUrl;
+    delete state.videoMessageId;
+    delete state.videoProvider;
     delete state.quality;
     await putState(env, userId, state);
-    await answerCallback(env, q.id, "Link Video dipilih");
+    await answerCallback(env, q.id, sourceType === "upload" ? "Upload Video dipilih" : "Link Video dipilih");
     await editMessage(env, chatId, msg.message_id,
-      state.mode === "simpan"
-        ? "🔗 Link Video dipilih.\n\nKirim URL video (harus diawali https://)."
-        : "🔗 Link Video dipilih.\n\nKirim URL video kualitas tambahan (harus diawali https://)."
+      sourceType === "upload"
+        ? "🎥 Upload Video dipilih.\n\nKirim video Telegram sekarang."
+        : (state.mode === "simpan"
+          ? "🔗 Link Video dipilih.\n\nKirim URL video (harus diawali https://)."
+          : "🔗 Link Video dipilih.\n\nKirim URL video kualitas tambahan (harus diawali https://).")
     );
     return;
   }
@@ -806,7 +879,7 @@ async function handleCallback(q, env) {
       description: state.description,
       posterFileId: state.posterFileId || "",
       backdrop: "",
-      videos: {[state.quality]: {videoUrl: state.videoUrl, provider: "custom"}},
+      videos: {[state.quality]: {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}},
       videoUrl: state.videoUrl,
       quality: state.quality,
       addedAt: Date.now()
@@ -878,7 +951,7 @@ async function handleCallback(q, env) {
       return;
     }
     const videos = migratedVideos(movie);
-    videos[state.quality] = {videoUrl: state.videoUrl, provider: "custom"};
+    videos[state.quality] = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
     const patch = {videos};
     if (!movie.videoUrl) patch.videoUrl = state.videoUrl; // hanya isi jika film lama belum punya videoUrl utama
     await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);

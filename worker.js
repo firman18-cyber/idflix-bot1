@@ -10,12 +10,6 @@ const FB_SCOPE = "https://www.googleapis.com/auth/firebase.database https://www.
 const QUALITIES = ["360p","480p","720p","1080p","1440p","2160p"];
 const GENRES = ["Action","Adventure","Animation","Comedy","Crime","Documentary","Drama","Fantasy","Horror","Mystery","Romance","Sci-Fi","Thriller","War","Western","Family"];
 
-// ---- Konfigurasi Scraper (Bagian A) ------------------------------------
-const SCRAPE_TIMEOUT_MS = 12000;
-const SCRAPE_MAX_HTML_CHARS = 3_000_000; // batas ukuran HTML yang diproses (~3MB)
-const SCRAPE_MAX_CANDIDATES = 20;
-const SCRAPE_MAX_DISCOVERY_PAGES = 8;
-const SCRAPE_MAX_DISCOVERY_DEPTH = 2;
 const SUBTITLE_TIMEOUT_MS = 12000;
 const SUBTITLE_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -256,273 +250,6 @@ function isValidVideoUrl(text) {
   }
 }
 
-// ---- Scraper media publik (Bagian A) -----------------------------------
-// Hanya membaca HTML publik lewat fetch() biasa. Tidak ada bypass proteksi
-// apapun: 401/403/429 langsung dilaporkan sebagai "tidak dapat diakses".
-
-async function fetchWithTimeout(url, ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; IDFLIXBot/1.0; +scraper)",
-        "accept": "text/html,application/xhtml+xml"
-      }
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Deteksi kualitas dari string URL/file name. Tidak pernah menebak dari
-// ukuran file atau resolusi asli — murni pattern matching string.
-function detectQuality(url) {
-  const s = String(url || "");
-  const N = "(360|480|720|1080|1440|2160)";
-  // Prioritas pola dengan delimiter jelas saja — tidak menebak dari angka
-  // sembarang yang kebetulan muncul di URL (mis. id, timestamp, dsb).
-  const patterns = [
-    new RegExp(`${N}p\\b`, "i"),                                   // 720p
-    new RegExp(`[\\/_-]${N}(?=[\\/_-])`, "i"),                     // /720/ _720_ -720-
-    new RegExp(`${N}(?=\\.(?:mp4|m3u8)(?:[?#]|$))`, "i")           // 720.mp4 / 720.m3u8
-  ];
-  for (const re of patterns) {
-    const m = s.match(re);
-    if (m) return `${m[1]}p`;
-  }
-  if (/cam/i.test(s)) return "CAM";
-  return "UNKNOWN";
-}
-
-function mediaTypeFromUrl(u) {
-  if (/\.m3u8(?:[?#]|$)/i.test(u)) return "M3U8";
-  if (/\.mp4(?:[?#]|$)/i.test(u)) return "MP4";
-  return null;
-}
-
-function resolveMediaUrl(candidate, baseUrl) {
-  try {
-    return new URL(candidate, baseUrl).toString();
-  } catch {
-    return null;
-  }
-}
-
-// Ekstrak kandidat MP4/M3U8 dari HTML: URL absolut langsung di teks,
-// atribut umum (src, data-src, data-video, dst pada <video>/<source>),
-// dan pola JS/JSON inline seperti file:"..." atau source:"...".
-// Menangani juga string yang di-escape ("\/" -> "/") dan URL
-// protocol-relative ("//cdn..."), yang diresolve lewat resolveMediaUrl().
-// Deduplikasi berdasarkan URL absolut hasil resolve.
-function normalizeScrapeText(html) {
-  return String(html || "")
-    .replace(/\u002f/gi, "/")
-    .replace(/\u0026/gi, "&")
-    .replace(/\\//g, "/")
-    .replace(/&amp;/gi, "&");
-}
-
-function isObviouslyPrivateHost(url) {
-  try {
-    const u = new URL(url);
-    const h = u.hostname.toLowerCase();
-    if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local")) return true;
-    if (h === "0.0.0.0" || h === "::1") return true;
-    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-    if (!m) return false;
-    const a = Number(m[1]), b = Number(m[2]);
-    return a === 10 || a === 127 || (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-  } catch {
-    return true;
-  }
-}
-
-function extractPublicLinks(html, pageUrl) {
-  const normalized = normalizeScrapeText(html);
-  const found = new Map();
-  const add = (raw, kind) => {
-    if (!raw) return;
-    const value = String(raw).trim();
-    if (!/^https?:\/\//i.test(value) && !value.startsWith("//") && !value.startsWith("/")) return;
-    const abs = resolveMediaUrl(value, pageUrl);
-    if (!abs || isObviouslyPrivateHost(abs)) return;
-    try {
-      const u = new URL(abs);
-      if (u.protocol !== "http:" && u.protocol !== "https:") return;
-      found.set(abs, {url: abs, kind});
-    } catch {}
-  };
-
-  const patterns = [
-    /<iframe[^>]+(?:src|data-src)\s*=\s*["']([^"']+)["']/gi,
-    /<(?:script|source)[^>]+src\s*=\s*["']([^"']+)["']/gi,
-    /(?:player|embed|iframe|source|file|url|src)\s*[:=]\s*["']([^"']+)["']/gi
-  ];
-  for (const re of patterns) {
-    let m, guard = 0;
-    while ((m = re.exec(normalized)) && guard++ < 300) add(m[1], /iframe|embed/i.test(m[0]) ? "iframe" : "script");
-  }
-  return Array.from(found.values());
-}
-
-// Ekstrak kandidat MP4/M3U8 dari HTML/JS publik. Termasuk URL absolut,
-// atribut HTML, konfigurasi player JSON/JS, URL relative dan escaped URL.
-function extractMediaUrls(html, pageUrl) {
-  const normalized = normalizeScrapeText(html);
-  const found = new Map();
-  const patterns = [
-    /https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8)(?:\?[^\s"'<>\\]*)?/gi,
-    /(?:src|data-src|data-video|data-url|data-file|data-source|data-stream|file|source|url|playlist|manifest)\s*[:=]\s*["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi,
-    /["']([^"']+?\.(?:mp4|m3u8)(?:\?[^"']*)?)["']/gi
-  ];
-  for (const re of patterns) {
-    let match, guard = 0;
-    while ((match = re.exec(normalized)) && guard < 1000) {
-      const raw = match[1] || match[0];
-      const abs = resolveMediaUrl(raw, pageUrl);
-      if (!abs || isObviouslyPrivateHost(abs)) continue;
-      const type = mediaTypeFromUrl(abs);
-      if (!type || found.has(abs)) continue;
-      found.set(abs, {url: abs, type, quality: detectQuality(abs)});
-    }
-  }
-  return Array.from(found.values());
-}
-
-async function fetchPublicDiscovery(url) {
-  if (isObviouslyPrivateHost(url)) return {error: "private-host"};
-  try {
-    const res = await fetchWithTimeout(url, SCRAPE_TIMEOUT_MS);
-    if (res.status === 401 || res.status === 403 || res.status === 429) {
-      return {error: "protected", status: res.status};
-    }
-    if (!res.ok) return {error: "http", status: res.status};
-    const ct = res.headers.get("content-type") || "";
-    if (!/text\/html|application\/xhtml\+xml|javascript|json/i.test(ct)) {
-      return {error: "not-text", contentType: ct};
-    }
-    let body = await res.text();
-    if (body.length > SCRAPE_MAX_HTML_CHARS) body = body.slice(0, SCRAPE_MAX_HTML_CHARS);
-    return {ok: true, body, url: res.url || url, contentType: ct};
-  } catch (e) {
-    if (e?.name === "AbortError") return {error: "timeout"};
-    return {error: "network", detail: String(e?.message || e)};
-  }
-}
-
-// Discovery bertingkat hanya mengikuti resource yang dapat diakses secara publik.
-// Tidak mengirim cookie/session/auth header dan tidak mencoba melewati proteksi.
-async function discoverPublicMedia(startUrl) {
-  const queue = [{url: startUrl, depth: 0, kind: "page"}];
-  const visited = new Set();
-  const candidates = new Map();
-  let firstError = null;
-  let pagesScanned = 0;
-
-  while (queue.length && pagesScanned < SCRAPE_MAX_DISCOVERY_PAGES && candidates.size < SCRAPE_MAX_CANDIDATES) {
-    const item = queue.shift();
-    if (!item?.url || visited.has(item.url)) continue;
-    visited.add(item.url);
-    pagesScanned++;
-
-    const r = await fetchPublicDiscovery(item.url);
-    if (!r.ok) {
-      if (!firstError && (r.error === "protected" || r.error === "timeout")) firstError = r;
-      continue;
-    }
-
-    for (const c of extractMediaUrls(r.body, r.url)) {
-      if (!candidates.has(c.url)) {
-        candidates.set(c.url, {...c, discoveredFrom: r.url, via: item.kind});
-      }
-    }
-    if (candidates.size >= SCRAPE_MAX_CANDIDATES) break;
-    if (item.depth >= SCRAPE_MAX_DISCOVERY_DEPTH) continue;
-
-    for (const link of extractPublicLinks(r.body, r.url)) {
-      if (visited.has(link.url) || queue.some(x => x.url === link.url)) continue;
-      // Follow iframe/player pages and external JS/JSON configs. Do not crawl
-      // arbitrary site links: only explicit player/embed/script references.
-      if (link.kind === "iframe" || link.kind === "script") {
-        queue.push({url: link.url, depth: item.depth + 1, kind: link.kind});
-      }
-      if (queue.length >= SCRAPE_MAX_DISCOVERY_PAGES) break;
-    }
-  }
-
-  return {
-    candidates: Array.from(candidates.values()),
-    pagesScanned,
-    firstError
-  };
-}
-
-// Ambil HTML publik dan validasi. Mengembalikan {error:...} untuk setiap
-// kondisi gagal, atau {ok:true, candidates:[...]} jika berhasil.
-async function scrapePage(pageUrl) {
-  if (isObviouslyPrivateHost(pageUrl)) return {error: "private-host"};
-  const root = await fetchPublicDiscovery(pageUrl);
-  if (!root.ok) {
-    if (root.error === "protected") return {error: "protected", status: root.status};
-    if (root.error === "timeout") return {error: "timeout"};
-    if (root.error === "http" && root.status === 404) return {error: "notfound-http"};
-    if (root.error === "http" && root.status >= 500) return {error: "server", status: root.status};
-    if (root.error === "http" && root.status === 400) return {error: "badrequest"};
-    if (root.error === "http") return {error: "http", status: root.status};
-    if (root.error === "not-text") return {error: "nothtml", contentType: root.contentType};
-    if (root.error === "network") return {error: "network", detail: root.detail};
-    return {error: root.error || "network"};
-  }
-
-  const discovered = await discoverPublicMedia(root.url || pageUrl);
-  if (!discovered.candidates.length) return {error: "notfound", pagesScanned: discovered.pagesScanned};
-  return {
-    ok: true,
-    candidates: discovered.candidates,
-    pagesScanned: discovered.pagesScanned
-  };
-}
-
-function scrapeKeyboard(candidates) {
-  const rows = candidates.map((c, i) => [{text: `▶ ${c.quality} ${c.type}`, callback_data: `sc_pick:${i}`}]);
-  rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
-  return {inline_keyboard: rows};
-}
-
-// Dipakai saat kandidat scrape terdeteksi CAM/UNKNOWN: admin WAJIB memilih
-// quality database resmi (QUALITIES) — CAM/UNKNOWN tidak pernah menjadi key.
-function dbQualityKeyboard() {
-  const rows = [];
-  for (let i = 0; i < QUALITIES.length; i += 3) {
-    rows.push(QUALITIES.slice(i, i + 3).map(q => ({text: q, callback_data: `sc_qpick:${q}`})));
-  }
-  rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
-  return {inline_keyboard: rows};
-}
-
-// Bangun teks + keyboard konfirmasi (tambah baru vs overwrite) berdasarkan
-// state.targetQuality yang SUDAH pasti berupa quality resmi (QUALITIES).
-function buildScrapeDecision(movie, state) {
-  const quality = state.targetQuality;
-  const exists = !!migratedVideos(movie)[quality];
-  const text = exists
-    ? `⚠️ ${quality} sudah tersedia untuk film ${movie.title}.\n🔗 URL baru: ${state.pending.url}`
-    : `🎬 ${movie.title}\n\nQuality: ${quality}\nType: ${state.pending.type}\n🔗 ${state.pending.url}\n\nTambahkan kualitas ini ke film?`;
-  const keyboard = exists
-    ? {inline_keyboard: [
-        [{text: "♻️ Overwrite URL", callback_data: "sc_overwrite"}],
-        [{text: "❌ Batal", callback_data: "cancel"}]
-      ]}
-    : {inline_keyboard: [
-        [{text: "✅ Tambah ke Film", callback_data: "sc_confirmadd"}],
-        [{text: "❌ Batal", callback_data: "cancel"}]
-      ]};
-  return {text, keyboard};
-}
 
 // ---- Subtitle manual (Bagian B) -----------------------------------------
 // Migrasi runtime untuk film lama yang hanya punya {videoUrl, quality} di
@@ -586,6 +313,14 @@ function qualityKeyboard(selected = "") {
   };
 }
 
+function videoSourceKeyboard(mode) {
+  return {inline_keyboard:[
+    [{text:"🔗 Link Video", callback_data:`source:link:${mode}`}],
+    [{text:"🎥 Upload Video", callback_data:`source:upload:${mode}`}],
+    [{text:"❌ Batal", callback_data:"cancel"}]
+  ]};
+}
+
 function genreKeyboard(selected = []) {
   const set = new Set(selected);
   const rows = [];
@@ -632,8 +367,12 @@ Deskripsi: ${s.description || "-"}
 
 async function askNext(env, state, chatId) {
   if (state.mode === "simpan") {
-    if (!state.videoUrl) {
+    if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
+      return;
+    }
+    if (!state.sourceType) {
+      await sendMessage(env, chatId, "🎬 Pilih sumber video:", {reply_markup:videoSourceKeyboard("simpan")});
       return;
     }
     if (!state.quality) {
@@ -664,8 +403,12 @@ async function askNext(env, state, chatId) {
     }
     await sendMessage(env, chatId, formatSummary(state), {reply_markup:confirmKeyboard()});
   } else if (state.mode === "tambah") {
-    if (!state.videoUrl) {
+    if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
+      return;
+    }
+    if (!state.sourceType) {
+      await sendMessage(env, chatId, "🎬 Pilih sumber video:", {reply_markup:videoSourceKeyboard("tambah")});
       return;
     }
     if (!state.quality) {
@@ -769,7 +512,6 @@ async function handleAdminText(msg, env) {
       "1. /poster — tambah poster atau backdrop\n" +
       "2. /simpan <judul> — tambah film baru\n" +
       "3. /tambah <judul> — tambah kualitas video ke film yang sudah ada\n\n" +
-      "/scrape <url> — cari URL MP4/M3U8 publik dari halaman\n" +
       "/subtitle <judul> — upload subtitle .srt/.vtt untuk film\n" +
       "/list — daftar film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
     return;
@@ -824,9 +566,9 @@ async function handleAdminText(msg, env) {
       await sendMessage(env, chatId, "⚠️ Kirim poster film terlebih dahulu (upload gambar), lalu jalankan /simpan <judul> lagi.");
       return;
     }
-    const state = {userId, mode:"simpan", title, posterFileId, createdAt:Date.now(), chatId};
+    const state = {userId, mode:"simpan", title, posterFileId, createdAt:Date.now(), chatId, step:"await_source"};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Judul: ${title}\n🖼️ Poster: tersimpan\n\n🔗 Kirim link video Dosya.at atau hosting lain (harus diawali https://)`);
+    await sendMessage(env, chatId, `🎬 Tambah Film\n\nJudul: ${title}\n🖼️ Poster: tersimpan\n\nPilih sumber video:`, {reply_markup:videoSourceKeyboard("simpan")});
     return;
   }
 
@@ -835,51 +577,12 @@ async function handleAdminText(msg, env) {
     if (!title) return sendMessage(env, chatId, "Format: /tambah <judul>");
     const found = await findMovieByTitle(env, title);
     if (!found) return sendMessage(env, chatId, `❌ Film "${title}" belum ditemukan di Firebase.`);
-    const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId};
+    const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId, step:"await_source"};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Film ditemukan: ${found.movie.title}\n\n🔗 Kirim link video kualitas tambahan (harus diawali https://)`);
+    await sendMessage(env, chatId, `🎬 Tambah Kualitas\n\nFilm: ${found.movie.title}\n\nPilih sumber video:`, {reply_markup:videoSourceKeyboard("tambah")});
     return;
   }
 
-  if (text.startsWith("/scrape ")) {
-    const raw = text.slice(8).trim();
-    if (!raw) return sendMessage(env, chatId, "Format: /scrape <URL>");
-    let target;
-    try {
-      target = new URL(raw);
-      if (!/^https?:$/.test(target.protocol)) throw new Error("bad-protocol");
-    } catch {
-      return sendMessage(env, chatId, "❌ URL tidak valid. Format: /scrape https://...");
-    }
-
-    await sendMessage(env, chatId, "🔍 Memindai halaman + player/video host publik, mohon tunggu...");
-    const result = await scrapePage(target.toString());
-
-    if (result.error === "timeout") return sendMessage(env, chatId, "⏱️ Permintaan ke halaman timeout. Coba lagi nanti.");
-    if (result.error === "protected") return sendMessage(env, chatId,
-      `⚠️ Halaman tidak dapat diakses sebagai resource publik (status ${result.status}).\n\nScraper tidak melakukan bypass login/CAPTCHA/DRM/anti-bot.`);
-    if (result.error === "notfound-http") return sendMessage(env, chatId, "❌ Halaman tidak ditemukan (404).");
-    if (result.error === "server") return sendMessage(env, chatId, `❌ Server halaman mengalami error (status ${result.status}). Coba lagi nanti.`);
-    if (result.error === "badrequest") return sendMessage(env, chatId, "❌ Permintaan tidak valid (400). Periksa kembali URL.");
-    if (result.error === "http") return sendMessage(env, chatId, `❌ Gagal mengambil halaman (status ${result.status}).`);
-    if (result.error === "nothtml") return sendMessage(env, chatId, `ℹ️ Resource bukan halaman HTML yang dapat dipindai (content-type: ${result.contentType || "-"}).`);
-    if (result.error === "empty") return sendMessage(env, chatId, "❌ Halaman kosong, tidak ada konten untuk dipindai.");
-    if (result.error === "network") return sendMessage(env, chatId, `❌ Gagal mengakses URL: ${result.detail || "unknown error"}`);
-    if (result.error === "notfound") return sendMessage(env, chatId, `❌ Tidak ditemukan URL MP4/M3U8 publik.
-
-Scraper sudah memeriksa halaman utama dan player/iframe publik yang direferensikan (maks. ${SCRAPE_MAX_DISCOVERY_PAGES} resource, kedalaman ${SCRAPE_MAX_DISCOVERY_DEPTH}).`);
-
-    const candidates = result.candidates.slice(0, SCRAPE_MAX_CANDIDATES);
-    const truncated = result.candidates.length > SCRAPE_MAX_CANDIDATES;
-    const state = {userId, mode: "scrape", chatId, candidates, createdAt: Date.now()};
-    await putState(env, userId, state);
-
-    const lines = candidates.map((c, i) => `${i + 1}. 🎬 ${c.quality}\n   ${c.type}\n   ${c.url}\n   ↳ ${c.via === "iframe" ? "player/iframe publik" : "resource publik"}`);
-    const extra = truncated ? `\n\n...ditemukan lebih banyak, hanya ${SCRAPE_MAX_CANDIDATES} kandidat pertama yang ditampilkan.` : "";
-    await sendMessage(env, chatId, `🔎 Hasil Scrape (${candidates.length})\n\n${lines.join("\n\n")}${extra}`,
-      {reply_markup: scrapeKeyboard(candidates)});
-    return;
-  }
 
   if (text.startsWith("/subtitle ")) {
     const title = text.slice(10).trim();
@@ -927,43 +630,19 @@ Scraper sudah memeriksa halaman utama dan player/iframe publik yang direferensik
 
   if (!text) return; // abaikan pesan non-teks lain di luar flow yang dikenal
 
-  if (state.mode === "scrape" && state.step === "await_title") {
-    const title = text.trim();
-    if (!title) return;
-    const found = await findMovieByTitle(env, title);
-    if (!found) {
-      await sendMessage(env, chatId,
-        `❌ Film "${title}" belum ditemukan. Gunakan /tambah <judul> atau /simpan <judul> untuk membuat film ini terlebih dahulu, lalu ulangi memilih kandidat scrape.\n\nKetik judul lain atau /batal untuk membatalkan.`);
-      return;
-    }
-    state.movieId = found.id;
-    const detected = state.pending.quality;
 
-    if (QUALITIES.includes(detected)) {
-      // Quality terdeteksi valid (bukan CAM/UNKNOWN) — langsung dipakai.
-      state.targetQuality = detected;
-      delete state.step;
-      await putState(env, userId, state);
-      const decision = buildScrapeDecision(found.movie, state);
-      await sendMessage(env, chatId, decision.text, {reply_markup: decision.keyboard});
-    } else {
-      // CAM/UNKNOWN: jangan pernah jadi key database. Admin wajib pilih
-      // quality resmi dari daftar QUALITIES.
-      state.step = "await_quality_pick";
-      await putState(env, userId, state);
-      await sendMessage(env, chatId,
-        `ℹ️ Kualitas terdeteksi: ${detected} (bukan quality database resmi).\n\nPilih quality database yang sesuai untuk film ${found.movie.title}:`,
-        {reply_markup: dbQualityKeyboard()});
-    }
+  if ((state.mode === "simpan" || state.mode === "tambah") && !state.sourceType) {
+    await sendMessage(env, chatId, "🎬 Pilih sumber video terlebih dahulu.", {reply_markup:videoSourceKeyboard(state.mode)});
     return;
   }
 
-  if ((state.mode === "simpan" || state.mode === "tambah") && !state.videoUrl) {
+  if ((state.mode === "simpan" || state.mode === "tambah") && state.sourceType === "link" && !state.videoUrl) {
     if (!isValidVideoUrl(text)) {
       await sendMessage(env, chatId, "❌ URL tidak valid. URL harus diawali https:// dan berupa link yang valid.\n\n🔗 Kirim link video.");
       return;
     }
     state.videoUrl = text;
+    state.step = "await_quality";
     await putState(env, userId, state);
     await askNext(env, state, chatId);
     return;
@@ -1008,6 +687,34 @@ async function handleCallback(q, env) {
     await delState(env, userId);
     await answerCallback(env, q.id, "Dibatalkan");
     await editMessage(env, chatId, msg.message_id, "❌ Proses dibatalkan.");
+    return;
+  }
+
+  if (data.startsWith("source:")) {
+    const parts = data.split(":");
+    const sourceType = parts[1];
+    const sourceMode = parts[2];
+
+    if ((sourceMode !== "simpan" && sourceMode !== "tambah") || state.mode !== sourceMode) {
+      return answerCallback(env, q.id, "Sesi sumber video tidak valid.");
+    }
+
+    if (sourceType !== "link") {
+      await answerCallback(env, q.id, "Alur upload video belum diaktifkan pada patch ini.");
+      return;
+    }
+
+    state.sourceType = "link";
+    state.step = "await_video_url";
+    delete state.videoUrl;
+    delete state.quality;
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, "Link Video dipilih");
+    await editMessage(env, chatId, msg.message_id,
+      state.mode === "simpan"
+        ? "🔗 Link Video dipilih.\n\nKirim URL video (harus diawali https://)."
+        : "🔗 Link Video dipilih.\n\nKirim URL video kualitas tambahan (harus diawali https://)."
+    );
     return;
   }
 
@@ -1145,123 +852,6 @@ async function handleCallback(q, env) {
     return;
   }
 
-  // ---- Callback Scraper (Bagian A) ----
-  if (data.startsWith("sc_pick:")) {
-    if (state.mode !== "scrape" || !Array.isArray(state.candidates)) {
-      return answerCallback(env, q.id, "Sesi scrape tidak valid.");
-    }
-    const idx = Number(data.slice(8));
-    const cand = state.candidates[idx];
-    if (!cand) return answerCallback(env, q.id, "Kandidat tidak ditemukan.");
-    state.pending = cand;
-    delete state.step;
-    delete state.movieId;
-    await putState(env, userId, state);
-    await answerCallback(env, q.id, `Dipilih: ${cand.quality} ${cand.type}`);
-    await editMessage(env, chatId, msg.message_id,
-      `🎬 URL ditemukan\n\nQuality: ${cand.quality}\nType: ${cand.type}\n🔗 ${cand.url}\n\nPilih tindakan:`, {
-        reply_markup: {inline_keyboard: [
-          [{text: "➕ Tambah ke Film", callback_data: "sc_addfilm"}],
-          [{text: "❌ Batalkan", callback_data: "cancel"}]
-        ]}
-      });
-    return;
-  }
-
-  if (data === "sc_addfilm") {
-    if (state.mode !== "scrape" || !state.pending) return answerCallback(env, q.id, "Pilih kandidat terlebih dahulu.");
-    state.step = "await_title";
-    await putState(env, userId, state);
-    await answerCallback(env, q.id, "Ketik judul film");
-    await editMessage(env, chatId, msg.message_id,
-      "📌 Ketik judul film tujuan (harus sudah ada di database, gunakan judul yang sama seperti /tambah).");
-    return;
-  }
-
-  // CAM/UNKNOWN: admin memilih quality database resmi dari QUALITIES.
-  if (data.startsWith("sc_qpick:")) {
-    if (state.mode !== "scrape" || state.step !== "await_quality_pick" || !state.movieId || !state.pending) {
-      return answerCallback(env, q.id, "Sesi scrape tidak valid.");
-    }
-    const chosen = data.slice(9);
-    if (!QUALITIES.includes(chosen)) return answerCallback(env, q.id, "Quality tidak valid.");
-    const movie = await getMovie(env, state.movieId);
-    if (!movie) {
-      await delState(env, userId);
-      await answerCallback(env, q.id, "Film tidak ditemukan.");
-      await editMessage(env, chatId, msg.message_id, "❌ Film tidak ditemukan lagi di database.");
-      return;
-    }
-    state.targetQuality = chosen;
-    delete state.step;
-    await putState(env, userId, state);
-    await answerCallback(env, q.id, `Quality dipilih: ${chosen}`);
-    const decision = buildScrapeDecision(movie, state);
-    await editMessage(env, chatId, msg.message_id, decision.text, {reply_markup: decision.keyboard});
-    return;
-  }
-
-  if (data === "sc_confirmadd") {
-    if (state.mode !== "scrape" || !state.pending || !state.movieId || !state.targetQuality) {
-      return answerCallback(env, q.id, "Data belum lengkap.");
-    }
-    const movie = await getMovie(env, state.movieId);
-    if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
-    const quality = state.targetQuality;
-    const videos = migratedVideos(movie);
-    if (videos[quality]) {
-      await answerCallback(env, q.id, "Kualitas sudah ada, gunakan Overwrite.");
-      return;
-    }
-    // Quality baru: tidak ada object lama untuk dipertahankan, tapi tetap
-    // pakai pola spread yang sama supaya konsisten dengan overwrite.
-    videos[quality] = {
-      ...(videos[quality] || {}),
-      videoUrl: state.pending.url,
-      provider: "scrape",
-      format: state.pending.type
-    };
-    const patch = {videos};
-    if (!movie.videoUrl) patch.videoUrl = state.pending.url;
-    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
-    await delState(env, userId);
-    await answerCallback(env, q.id, "Ditambahkan.");
-    await editMessage(env, chatId, msg.message_id,
-      `✅ Kualitas ${quality} berhasil ditambahkan ke ${movie.title} dari hasil scrape.\n🔗 ${state.pending.url}`);
-    return;
-  }
-
-  if (data === "sc_overwrite") {
-    if (state.mode !== "scrape" || !state.pending || !state.movieId || !state.targetQuality) {
-      return answerCallback(env, q.id, "Data belum lengkap.");
-    }
-    const movie = await getMovie(env, state.movieId);
-    if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
-    const quality = state.targetQuality;
-    const videos = migratedVideos(movie);
-    // PENTING: pertahankan metadata lama (termasuk subtitle) pada quality
-    // ini — hanya videoUrl/provider/format yang diganti.
-    videos[quality] = {
-      ...(videos[quality] || {}),
-      videoUrl: state.pending.url,
-      provider: "scrape",
-      format: state.pending.type
-    };
-    const patch = {videos};
-    // Sinkronkan field legacy jika film lama masih menjadikan quality ini
-    // sebagai video utama. Ini mencegah frontend lama membaca URL yang stale.
-    if (movie.quality === quality) {
-      patch.videoUrl = state.pending.url;
-      patch.quality = quality;
-      patch.provider = "scrape";
-    }
-    await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
-    await delState(env, userId);
-    await answerCallback(env, q.id, "Diperbarui.");
-    await editMessage(env, chatId, msg.message_id,
-      `✅ ${quality} berhasil diperbarui (overwrite) untuk ${movie.title}. Subtitle & metadata lain pada quality ini tetap dipertahankan.\n🔗 ${state.pending.url}`);
-    return;
-  }
 
   // ---- Callback Subtitle (Bagian B) ----
   if (data.startsWith("sub_q:")) {
@@ -1571,9 +1161,7 @@ export default {
     try {
       const update = await request.json();
 
-      // Telegram webhook harus segera mendapat HTTP 200. Jangan menunggu
-      // scraper/player discovery selesai karena proses tersebut bisa memakan
-      // beberapa detik dan menyebabkan Telegram mengirim ulang update yang sama.
+      // Telegram webhook harus segera mendapat HTTP 200 agar tidak memicu retry update.
       const task = Promise.resolve()
         .then(() => handleUpdate(update, env))
         .catch(async (e) => {
@@ -1595,8 +1183,7 @@ export default {
           } catch (_) {}
         });
 
-      // Cloudflare Worker akan menjaga task tetap hidup setelah response
-      // dikirim, tanpa membuat Telegram menunggu seluruh proses scraper.
+      // Cloudflare Worker menjaga task tetap hidup setelah response dikirim.
       if (typeof request.cf !== "undefined") {
         // no-op: hanya menjaga kompatibilitas dengan runtime Cloudflare.
       }

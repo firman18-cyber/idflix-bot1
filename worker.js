@@ -186,6 +186,28 @@ async function getMovie(env, id) {
   return firebaseRequest(env, "GET", `movies/${id}`);
 }
 
+function normalizeMovieTitle(title) {
+  return String(title || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[“”‘’]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function findMovieByIdentity(env, title, year) {
+  const movies = await firebaseRequest(env, "GET", "movies") || {};
+  const targetTitle = normalizeMovieTitle(title);
+  const targetYear = Number(year);
+  for (const [id, movie] of Object.entries(movies)) {
+    if (normalizeMovieTitle(movie?.title) !== targetTitle) continue;
+    if (Number(movie?.year) !== targetYear) continue;
+    return {id, movie};
+  }
+  return null;
+}
+
 async function findMovieByTitle(env, title) {
   const movies = await firebaseRequest(env, "GET", "movies") || {};
   const target = title.trim().toLowerCase();

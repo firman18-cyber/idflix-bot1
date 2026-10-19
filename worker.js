@@ -1648,9 +1648,14 @@ async function serveSubtitle(request, env) {
 
   // Series: web memanggil /subtitle/<filmId>/<quality>?ep=<epId>
   const epParam = url.searchParams.get("ep");
+  // Subtitle tidak terikat resolusi: utamakan kualitas yang diminta, lalu kualitas lain yang punya subtitle.
+  const pickSub = vids =>
+    vids?.[quality]?.subtitle?.fileId || vids?.[quality]?.subtitle?.file_id
+      ? vids[quality].subtitle
+      : Object.values(vids || {}).map(x => x?.subtitle).find(x => x?.fileId || x?.file_id);
   const sub = epParam
-    ? episodeList(movie).find(e => e.id === epParam)?.videos?.[quality]?.subtitle
-    : migratedVideos(movie)[quality]?.subtitle;
+    ? pickSub(episodeList(movie).find(e => e.id === epParam)?.videos)
+    : pickSub(migratedVideos(movie));
   const fileId = sub?.fileId || sub?.file_id || "";
   if (!fileId) return new Response("Subtitle tidak tersedia", {status: 404, headers: corsHeaders()});
 

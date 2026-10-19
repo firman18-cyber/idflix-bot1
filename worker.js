@@ -327,6 +327,15 @@ function getAvailableQualities(movie) {
   return QUALITIES.filter(q => videos[q]);
 }
 
+function subtitleCancelKeyboard() {
+  return {inline_keyboard: [[{text: "❌ Batal", callback_data: "cancel"}]]};
+}
+
+function subtitlePrompt(title, episodeLabel) {
+  return `📄 Silakan kirim file subtitle untuk ${title}${episodeLabel ? ` — ${episodeLabel}` : ""}.\n\n` +
+    "Berlaku untuk semua kualitas video.\nFormat:\n• .srt\n• .vtt\n\nBahasa default: Indonesia";
+}
+
 function subtitleQualityKeyboard(qualities) {
   const rows = [];
   for (let i = 0; i < qualities.length; i += 3) {
@@ -781,47 +790,48 @@ async function handleAdminText(msg, env) {
       }
       if (state.episodeId) {
         const ep = episodeList(movie).find(e => e.id === state.episodeId);
-        if (!ep || !ep.videos[state.quality]) {
+        const epQualities = ep ? QUALITIES.filter(q => ep.videos[q]) : [];
+        if (!ep || !epQualities.length) {
           await delState(env, userId);
-          await sendMessage(env, chatId, "❌ Episode atau kualitas tersebut tidak lagi tersedia.");
+          await sendMessage(env, chatId, "❌ Episode tidak lagi tersedia atau belum punya kualitas video.");
           return;
         }
-        const hadEpSubtitle = !!ep.videos[state.quality].subtitle;
-        await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${state.episodeId}/videos/${state.quality}`, {
-          subtitle: {
-            fileId: msg.document.file_id,
-            fileName: fileName || `subtitle.${ext}`,
-            language: "id",
-            format: ext
-          }
-        });
-        await delState(env, userId);
-        await sendMessage(env, chatId, hadEpSubtitle
-          ? `✅ Subtitle ${state.episodeLabel} (${state.quality}) berhasil diperbarui.`
-          : `✅ Subtitle ${state.episodeLabel} (${state.quality}) berhasil disimpan.`);
-        return;
-      }
-      const videos = migratedVideos(movie);
-      if (!videos[state.quality]) {
-        await delState(env, userId);
-        await sendMessage(env, chatId, "❌ Kualitas tersebut tidak lagi tersedia pada film ini.");
-        return;
-      }
-      const hadSubtitle = !!videos[state.quality].subtitle;
-      videos[state.quality] = {
-        ...videos[state.quality],
-        subtitle: {
+        const hadEpSubtitle = epQualities.some(q => ep.videos[q].subtitle);
+        const epSub = {
           fileId: msg.document.file_id,
           fileName: fileName || `subtitle.${ext}`,
           language: "id",
           format: ext
+        };
+        for (const q of epQualities) {
+          await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${state.episodeId}/videos/${q}`, {subtitle: epSub});
         }
+        await delState(env, userId);
+        await sendMessage(env, chatId, hadEpSubtitle
+          ? `✅ Subtitle ${state.episodeLabel} berhasil diperbarui (semua kualitas).`
+          : `✅ Subtitle ${state.episodeLabel} berhasil disimpan (semua kualitas).`);
+        return;
+      }
+      const videos = migratedVideos(movie);
+      const filmQualities = QUALITIES.filter(q => videos[q]);
+      if (!filmQualities.length) {
+        await delState(env, userId);
+        await sendMessage(env, chatId, "❌ Film ini belum memiliki kualitas video apapun.");
+        return;
+      }
+      const hadSubtitle = filmQualities.some(q => videos[q].subtitle);
+      const filmSub = {
+        fileId: msg.document.file_id,
+        fileName: fileName || `subtitle.${ext}`,
+        language: "id",
+        format: ext
       };
+      for (const q of filmQualities) videos[q] = {...videos[q], subtitle: filmSub};
       await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, {videos});
       await delState(env, userId);
       await sendMessage(env, chatId, hadSubtitle
-        ? `✅ Subtitle ${state.quality} berhasil diperbarui.`
-        : `✅ Subtitle ${state.quality} berhasil disimpan.`);
+        ? "✅ Subtitle berhasil diperbarui (semua kualitas)."
+        : "✅ Subtitle berhasil disimpan (semua kualitas).");
       return;
     }
     // Document di luar alur /subtitle: abaikan, jangan ganggu fitur lain.
@@ -998,9 +1008,10 @@ async function handleAdminText(msg, env) {
       movieId: found.id, movieTitle: found.movie.title,
       availableQualities, createdAt: Date.now()
     };
+    state.step = "await_subtitle_file";
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 ${found.movie.title}\n\nPilih kualitas subtitle:`,
-      {reply_markup: subtitleQualityKeyboard(availableQualities)});
+    await sendMessage(env, chatId, subtitlePrompt(found.movie.title),
+      {reply_markup: subtitleCancelKeyboard()});
     return;
   }
 
@@ -1387,11 +1398,12 @@ async function handleCallback(q, env) {
     state.episodeId = ep.id;
     state.episodeLabel = `Musim ${ep.season} Eps ${ep.number}`;
     state.availableQualities = qualities;
+    state.step = "await_subtitle_file";
     await putState(env, userId, state);
     await answerCallback(env, q.id, state.episodeLabel);
     await editMessage(env, chatId, msg.message_id,
-      `📺 ${state.movieTitle} — ${state.episodeLabel}\n\nPilih kualitas subtitle:`,
-      {reply_markup: subtitleQualityKeyboard(qualities)});
+      subtitlePrompt(state.movieTitle, state.episodeLabel),
+      {reply_markup: subtitleCancelKeyboard()});
     return;
   }
 

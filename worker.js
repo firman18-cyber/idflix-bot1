@@ -388,10 +388,29 @@ function qualityKeyboard(selected = "", existing = []) {
   };
 }
 
+// Resolusi yang sudah dikumpulkan di sesi ini (belum disimpan ke Firebase) untuk /simpan & /tambah.
+const pendingItems = state => Array.isArray(state?.items) ? state.items : [];
+// Kualitas bertanda 🔁 di keyboard: yang sudah ada di database + yang sudah dipilih di sesi ini.
+const markedQualities = state => [...new Set([...(state?.existingQualities || []), ...pendingItems(state).map(i => i.quality)])];
+
 function qualityPromptText(state) {
   const ex = Array.isArray(state?.existingQualities) ? state.existingQualities : [];
+  const pend = pendingItems(state).map(i => i.quality);
   return "🎞️ PILIH KUALITAS VIDEO" +
-    (ex.length ? `\n\n🔁 = sudah ada (${ex.join(", ")}). Pilih kualitas bertanda 🔁 untuk MENIMPA link lama.` : "");
+    (ex.length ? `\n\n🔁 = sudah ada (${ex.join(", ")}). Pilih kualitas bertanda 🔁 untuk MENIMPA link lama.` : "") +
+    (pend.length ? `\n\n🗂️ Sudah ditambahkan di sesi ini: ${pend.join(", ")} (memilih lagi akan mengganti linknya).` : "");
+}
+
+function itemLines(items) {
+  return items.map(i => `• ${i.quality} — ${i.videoUrl}`).join("\n");
+}
+
+function moreResolutionKeyboard(mode) {
+  return {inline_keyboard:[
+    [{text:"➕ Tambah resolusi lain", callback_data:"res_more"}],
+    [{text: mode === "simpan" ? "✅ Selesai, lanjut isi data film" : "✅ Selesai, lanjut konfirmasi", callback_data:"res_done"}],
+    [{text:"❌ Batal", callback_data:"cancel"}]
+  ]};
 }
 
 function videoSourceKeyboard(mode) {
@@ -756,14 +775,15 @@ function formatSummary(s) {
   return `🎬 KONFIRMASI FILM
 
 Judul: ${s.title}
-Kualitas: ${s.quality}
+Resolusi: ${pendingItems(s).length ? pendingItems(s).map(i => i.quality).join(", ") : s.quality}
 Tahun: ${s.year || "-"}
 Genre: ${(s.genre || []).join(", ") || "-"}
 Rating: ${s.rating || "-"}
 Durasi: ${s.duration || "-"}
 Deskripsi: ${s.description || "-"}
 
-🔗 Video URL: ${s.videoUrl}
+🔗 Video:
+${pendingItems(s).length ? itemLines(pendingItems(s)) : s.videoUrl}
 🖼️ Poster: ${s.posterFileId ? "tersimpan (dari Telegram)" : "-"}`;
 }
 
@@ -782,7 +802,7 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", markedQualities(state))});
       return;
     }
     if (!state.year) {
@@ -868,7 +888,7 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", markedQualities(state))});
       return;
     }
     if (!state.existing && state.duration === undefined) {
@@ -893,15 +913,17 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", markedQualities(state))});
       return;
     }
-    const overwriteAdd = !!state.existingQualities?.includes(state.quality);
+    const addItems = pendingItems(state).length ? pendingItems(state) : [{quality: state.quality, videoUrl: state.videoUrl}];
+    const overlap = addItems.filter(i => state.existingQualities?.includes(i.quality)).map(i => i.quality);
+    const overwriteAdd = overlap.length > 0;
     await sendMessage(env, chatId,
-      `🎬 ${state.title}\n\nKualitas: ${state.quality}\n🔗 URL: ${state.videoUrl}\n\n` +
+      `🎬 ${state.title}\n\nAkan disimpan:\n${itemLines(addItems)}\n\n` +
       (overwriteAdd
-        ? `🔁 Link ${state.quality} yang lama akan DITIMPA (subtitle tetap dipertahankan). Klik TIMPA LINK untuk melanjutkan.`
-        : "Klik SIMPAN untuk menambahkan kualitas ini."),
+        ? `🔁 Link lama akan DITIMPA untuk: ${overlap.join(", ")} (subtitle tetap dipertahankan). Klik TIMPA LINK untuk melanjutkan.`
+        : "Klik SIMPAN untuk menambahkan semua resolusi di atas."),
       {reply_markup:addQualityKeyboard(overwriteAdd)});
   }
 }
@@ -948,7 +970,7 @@ async function storeUploadedVideo(env, msg, state, chatId) {
 
     await sendMessage(env, chatId,
       `✅ Video berhasil disimpan ke Teleplay.\n\n${qualityPromptText(state)}`,
-      {reply_markup:qualityKeyboard("", state.existingQualities || [])}
+      {reply_markup:qualityKeyboard("", markedQualities(state))}
     );
     return true;
   } catch (e) {
@@ -1310,6 +1332,11 @@ async function handleAdminText(msg, env) {
     return;
   }
 
+  if ((state.mode === "simpan" || state.mode === "tambah") && state.step === "after_resolution") {
+    await sendMessage(env, chatId, "Pilih lewat tombol: tambah resolusi lain atau selesai.", {reply_markup: moreResolutionKeyboard(state.mode)});
+    return;
+  }
+
   if ((state.mode === "simpan" || state.mode === "tambah") && !state.sourceType) {
     await sendMessage(env, chatId, "🎬 Pilih sumber video terlebih dahulu.", {reply_markup:videoSourceKeyboard(state.mode)});
     return;
@@ -1443,14 +1470,55 @@ async function handleCallback(q, env) {
     await answerCallback(env, q.id, willOverwrite ? `Kualitas ${chosen} (timpa link lama)` : `Kualitas ${chosen}`);
     await editMessage(env, chatId, msg.message_id,
       `🎞️ Kualitas dipilih: ${chosen}${willOverwrite ? "\n🔁 Link lama akan DITIMPA." : ""}\n\nKlik Lanjut.`,
-      {reply_markup:qualityKeyboard(chosen, state.existingQualities || [])});
+      {reply_markup:qualityKeyboard(chosen, markedQualities(state))});
     return;
   }
 
   if (data === "qdone") {
     if (!state.quality) return answerCallback(env, q.id, "Pilih kualitas terlebih dahulu.");
+    if (state.mode === "simpan" || state.mode === "tambah") {
+      // Kumpulkan resolusi ini, lalu tawarkan menambah resolusi lain sebelum menyimpan.
+      const items = pendingItems(state).filter(i => i.quality !== state.quality);
+      items.push({quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"});
+      state.items = items;
+      for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "quality"]) delete state[k];
+      state.step = "after_resolution";
+      await putState(env, userId, state);
+      await answerCallback(env, q.id, "Resolusi ditambahkan");
+      await editMessage(env, chatId, msg.message_id,
+        `✅ Resolusi ditambahkan (belum disimpan):\n${itemLines(items)}\n\nTambah resolusi lain, atau selesai?`,
+        {reply_markup: moreResolutionKeyboard(state.mode), link_preview_options: {is_disabled: true}});
+      return;
+    }
     await answerCallback(env, q.id, "Lanjut");
     await editMessage(env, chatId, msg.message_id, `✅ Kualitas: ${state.quality}`);
+    await askNext(env, state, chatId);
+    return;
+  }
+
+  if (data === "res_more" || data === "res_done") {
+    if ((state.mode !== "simpan" && state.mode !== "tambah") || state.step !== "after_resolution" || !pendingItems(state).length) {
+      return answerCallback(env, q.id, "Sesi tidak valid.");
+    }
+    if (data === "res_more") {
+      state.step = "await_source";
+      await putState(env, userId, state);
+      await answerCallback(env, q.id, "Tambah resolusi");
+      await editMessage(env, chatId, msg.message_id, `➕ Menambah resolusi lain.\nSudah ada: ${pendingItems(state).map(i => i.quality).join(", ")}`);
+      await askNext(env, state, chatId);
+      return;
+    }
+    // Selesai: isi field utama dari resolusi pertama supaya alur lama (tahun, genre, dst.) tetap jalan.
+    const first = pendingItems(state)[0];
+    state.sourceType = "multi";
+    state.videoUrl = first.videoUrl;
+    state.quality = first.quality;
+    state.videoProvider = first.provider;
+    state.step = "after_resolutions";
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, "Lanjut");
+    await editMessage(env, chatId, msg.message_id, `✅ ${pendingItems(state).length} resolusi siap disimpan:\n${itemLines(pendingItems(state))}`,
+      {link_preview_options: {is_disabled: true}});
     await askNext(env, state, chatId);
     return;
   }
@@ -1692,6 +1760,11 @@ async function handleCallback(q, env) {
       return answerCallback(env, q.id, "Data belum lengkap.");
     }
     await answerCallback(env, q.id, "Menyimpan film...");
+    const items = pendingItems(state).length
+      ? pendingItems(state)
+      : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}];
+    const videosMap = {};
+    for (const it of items) videosMap[it.quality] = {videoUrl: it.videoUrl, provider: it.provider || "custom"};
     const id = await uniqueMovieId(env, state.title);
     const movie = {
       type: "movie",
@@ -1703,9 +1776,9 @@ async function handleCallback(q, env) {
       description: state.description,
       posterFileId: state.posterFileId || "",
       backdrop: "",
-      videos: {[state.quality]: {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}},
-      videoUrl: state.videoUrl,
-      quality: state.quality,
+      videos: videosMap,
+      videoUrl: items[0].videoUrl,
+      quality: items[0].quality,
       addedAt: Date.now()
     };
     await firebaseRequest(env, "PUT", `movies/${id}`, movie);
@@ -1732,7 +1805,7 @@ async function handleCallback(q, env) {
       }
     }
     await sendMessage(env, chatId,
-      `✅ FILM BERHASIL DISIMPAN\n\n🎬 Judul: ${state.title}\n🆔 ID: ${id}\n🎞️ Kualitas: ${state.quality}\n📂 Genre: ${state.genre.join(", ")}\n🔗 Video: ${state.videoUrl}\n🖼️ Poster: tersimpan di Telegram (posterFileId)`);
+      `✅ FILM BERHASIL DISIMPAN\n\n🎬 Judul: ${state.title}\n🆔 ID: ${id}\n🎞️ Resolusi: ${items.map(i => i.quality).join(", ")}\n📂 Genre: ${state.genre.join(", ")}\n🔗 Video:\n${itemLines(items)}\n🖼️ Poster: tersimpan di Telegram (posterFileId)`);
 
     if (env.TELEGRAM_CHAT_ID) {
       for (const genre of state.genre) {
@@ -1740,7 +1813,7 @@ async function handleCallback(q, env) {
         if (threadId) {
           try {
             await sendMessage(env, env.TELEGRAM_CHAT_ID,
-              `🎬 ${state.title}\n🎞️ ${state.quality}\n⭐ ${state.rating}\n📅 ${state.year}`,
+              `🎬 ${state.title}\n🎞️ ${items.map(i => i.quality).join(", ")}\n⭐ ${state.rating}\n📅 ${state.year}`,
               {message_thread_id:Number(threadId)});
           } catch {}
         }
@@ -1765,26 +1838,38 @@ async function handleCallback(q, env) {
   }
 
   if (data === "confirm_add") {
-    if (!state.movieId || !state.videoUrl || !state.quality) return answerCallback(env, q.id, "Data belum lengkap.");
+    const items = pendingItems(state).length
+      ? pendingItems(state)
+      : (state.videoUrl && state.quality ? [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}] : []);
+    if (!state.movieId || !items.length) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
     const videos = migratedVideos(movie);
-    const old = videos[state.quality];
-    const overwrite = !!old;
-    // Spread data lama supaya subtitle tidak hilang; hanya link & provider yang diganti.
-    videos[state.quality] = {...(old || {}), videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
-    const patch = {videos};
-    // videoUrl utama: isi jika kosong, atau ganti jika itu memang link kualitas yang ditimpa.
-    if (!movie.videoUrl || (overwrite && (movie.quality === state.quality || movie.videoUrl === old.videoUrl))) {
-      patch.videoUrl = state.videoUrl;
+    const added = [];
+    const overwritten = [];
+    let rootUrl = movie.videoUrl || "";
+    for (const it of items) {
+      const old = videos[it.quality];
+      // Spread data lama supaya subtitle tidak hilang; hanya link & provider yang diganti.
+      videos[it.quality] = {...(old || {}), videoUrl: it.videoUrl, provider: it.provider || "custom"};
+      if (old) {
+        overwritten.push({...it, oldUrl: old.videoUrl || "-"});
+        // videoUrl utama ikut diganti jika itu memang link kualitas yang ditimpa.
+        if (movie.quality === it.quality || movie.videoUrl === old.videoUrl) rootUrl = it.videoUrl;
+      } else {
+        added.push(it);
+        if (!rootUrl) rootUrl = it.videoUrl;
+      }
     }
+    const patch = {videos};
+    if (rootUrl && rootUrl !== movie.videoUrl) patch.videoUrl = rootUrl;
     await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
     await delState(env, userId);
-    await answerCallback(env, q.id, overwrite ? "Link berhasil ditimpa." : "Kualitas berhasil ditambahkan.");
-    await editMessage(env, chatId, msg.message_id, overwrite
-      ? `🔁 Link ${state.quality} untuk ${movie.title} berhasil DITIMPA.\n\nLama: ${old.videoUrl || "-"}\nBaru: ${state.videoUrl}`
-      : `✅ Kualitas ${state.quality} berhasil ditambahkan ke ${movie.title}.\n🔗 ${state.videoUrl}`,
-      {link_preview_options: {is_disabled: true}});
+    await answerCallback(env, q.id, overwritten.length ? "Tersimpan (ada link ditimpa)." : "Kualitas berhasil ditambahkan.");
+    const parts = [`✅ TERSIMPAN — ${movie.title}`];
+    if (added.length) parts.push(`➕ Ditambahkan:\n${itemLines(added)}`);
+    if (overwritten.length) parts.push(`🔁 Ditimpa:\n${overwritten.map(i => `• ${i.quality}\n  Lama: ${i.oldUrl}\n  Baru: ${i.videoUrl}`).join("\n")}`);
+    await editMessage(env, chatId, msg.message_id, parts.join("\n\n"), {link_preview_options: {is_disabled: true}});
     return;
   }
 }

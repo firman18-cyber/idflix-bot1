@@ -21,7 +21,7 @@ function isAdmin(from, env) {
 // Error Telegram yang tidak fatal dan tidak boleh menggagalkan Worker.
 const NON_FATAL_TG_ERROR = /message is not modified|query is too old|response timeout expired|query id is invalid/i;
 
-async function tg(env, method, body) {
+async function tg(env, method, body, attempt = 0) {
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: {"content-type":"application/json"},
@@ -30,6 +30,13 @@ async function tg(env, method, body) {
   const data = await r.json();
   if (!data.ok) {
     const desc = String(data.description || "unknown error");
+    // Rate limit (429): tunggu sesuai retry_after lalu coba lagi (maks 2x),
+    // supaya batch upload tidak berujung "Too Many Requests".
+    const retryAfter = Number(data.parameters?.retry_after || desc.match(/retry after (\d+)/i)?.[1] || 0);
+    if (data.error_code === 429 && retryAfter > 0 && retryAfter <= 20 && attempt < 2) {
+      await new Promise(res => setTimeout(res, (retryAfter + 1) * 1000));
+      return tg(env, method, body, attempt + 1);
+    }
     if (NON_FATAL_TG_ERROR.test(desc)) {
       // Non-fatal: jangan lempar error, biarkan alur tetap berjalan.
       return null;
@@ -367,15 +374,24 @@ function corsHeaders() {
   };
 }
 
-function qualityKeyboard(selected = "") {
+// `existing` = kualitas yang sudah punya link. Tetap bisa dipilih: link lama
+// akan DITIMPA (ditandai 🔁), subtitle yang sudah ada tidak ikut terhapus.
+function qualityKeyboard(selected = "", existing = []) {
+  const label = q => selected === q ? `☑️ ${q}` : (existing.includes(q) ? `🔁 ${q}` : `☐ ${q}`);
   return {
     inline_keyboard: [
-      QUALITIES.slice(0,3).map(q => ({text:selected===q ? `☑️ ${q}` : `☐ ${q}`, callback_data:`q:${q}`})),
-      QUALITIES.slice(3).map(q => ({text:selected===q ? `☑️ ${q}` : `☐ ${q}`, callback_data:`q:${q}`})),
+      QUALITIES.slice(0,3).map(q => ({text:label(q), callback_data:`q:${q}`})),
+      QUALITIES.slice(3).map(q => ({text:label(q), callback_data:`q:${q}`})),
       [{text:"➡️ Lanjut", callback_data:"qdone"}],
       [{text:"❌ Batal", callback_data:"cancel"}]
     ]
   };
+}
+
+function qualityPromptText(state) {
+  const ex = Array.isArray(state?.existingQualities) ? state.existingQualities : [];
+  return "🎞️ PILIH KUALITAS VIDEO" +
+    (ex.length ? `\n\n🔁 = sudah ada (${ex.join(", ")}). Pilih kualitas bertanda 🔁 untuk MENIMPA link lama.` : "");
 }
 
 function videoSourceKeyboard(mode) {
@@ -408,9 +424,9 @@ function confirmKeyboard() {
   ]};
 }
 
-function addQualityKeyboard() {
+function addQualityKeyboard(overwrite = false) {
   return {inline_keyboard:[
-    [{text:"✅ SIMPAN", callback_data:"confirm_add"}],
+    [{text: overwrite ? "🔁 TIMPA LINK" : "✅ SIMPAN", callback_data:"confirm_add"}],
     [{text:"❌ Batal", callback_data:"cancel"}]
   ]};
 }
@@ -450,9 +466,9 @@ function skipKeyboard(field) {
   ]};
 }
 
-function epsConfirmKeyboard(existing) {
+function epsConfirmKeyboard(existing, overwrite = false) {
   return {inline_keyboard:[
-    [{text: existing ? "✅ TAMBAH KUALITAS" : "✅ SIMPAN EPISODE", callback_data:"eps_save"}],
+    [{text: overwrite ? "🔁 TIMPA LINK" : (existing ? "✅ TAMBAH KUALITAS" : "✅ SIMPAN EPISODE"), callback_data:"eps_save"}],
     [{text:"❌ Batal", callback_data:"cancel"}]
   ]};
 }
@@ -464,12 +480,132 @@ function afterEpsKeyboard(nextNumber) {
   ]};
 }
 
+// ---- Batch subtitle series -----------------------------------------------
+const hasEpSubtitle = e => QUALITIES.some(q => e.videos[q]?.subtitle?.fileId || e.videos[q]?.subtitle?.file_id);
+
+// Kenali musim/episode dari nama file subtitle.
+// Contoh: Show.S01E03.srt, Show 1x03.vtt, Episode 3.srt, E03.srt, "Show - 03.srt".
+// Mengembalikan {season (0 = tidak disebut), number} atau null.
+function parseEpisodeFromFilename(fileName) {
+  const base = String(fileName || "").replace(/\.[a-z0-9]+$/i, "");
+  const ok = (season, number) => number >= 1 && number <= 999 ? {season, number} : null;
+  let m = base.match(/s(\d{1,2})[\s._-]*e(?:p(?:isode)?)?[\s._-]*(\d{1,3})(?!\d)/i);
+  if (m) return ok(Number(m[1]), Number(m[2]));
+  m = base.match(/(?<!\d)(\d{1,2})x(\d{2,3})(?!\d)/i);
+  if (m) return ok(Number(m[1]), Number(m[2]));
+  m = base.match(/(?:^|[^a-z])(?:episode|eps|ep|e)[\s._-]*0*(\d{1,3})(?!\d)/i);
+  if (m) return ok(0, Number(m[1]));
+  // Cadangan: angka terakhir di nama file, abaikan resolusi/codec (720, 1080, x264, ...).
+  const skip = new Set([264, 265, 360, 480, 720, 1080, 1440, 2160]);
+  const nums = [...base.matchAll(/(?<![\d.])(\d{1,3})(?!\d)/g)].map(x => Number(x[1])).filter(n => n > 0 && !skip.has(n));
+  return nums.length ? ok(0, nums[nums.length - 1]) : null;
+}
+
+function compactRanges(nums) {
+  const a = [...new Set(nums)].sort((x, y) => x - y);
+  const out = [];
+  for (let i = 0; i < a.length;) {
+    let j = i;
+    while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++;
+    out.push(j > i ? `${a[i]}-${a[j]}` : `${a[i]}`);
+    i = j + 1;
+  }
+  return out.join(", ");
+}
+
+function batchSubtitleSummary(movie, seasonFilter) {
+  const eps = episodeList(movie).filter(e => QUALITIES.some(q => e.videos[q]));
+  const seasons = [...new Set(eps.map(e => e.season))].sort((a, b) => a - b)
+    .filter(sn => !seasonFilter || sn === seasonFilter);
+  return seasons.map(sn => {
+    const inSeason = eps.filter(e => e.season === sn);
+    const have = inSeason.filter(hasEpSubtitle).map(e => e.number);
+    const miss = inSeason.filter(e => !hasEpSubtitle(e)).map(e => e.number);
+    return `Musim ${sn}\n  ✅ Sudah ada subtitle: ${compactRanges(have) || "-"}\n  ❌ Belum ada: ${compactRanges(miss) || "-"}`;
+  }).join("\n\n") || "Belum ada episode berkualitas video.";
+}
+
+function batchSubtitleScope(state) {
+  return state.season ? `Musim ${state.season}` : "semua musim";
+}
+
+function batchSubtitlePrompt(state) {
+  return `📦 BATCH SUBTITLE — ${state.movieTitle} (${batchSubtitleScope(state)})\n\n` +
+    "Kirim semua file subtitle (.srt / .vtt) sekaligus — boleh pilih banyak file dalam satu kali kirim.\n\n" +
+    "Episode dikenali dari NAMA FILE, contoh:\n" +
+    "• Show.S01E03.srt\n• E03.srt  /  Episode 3.vtt  /  Show - 03.srt\n" +
+    (state.season ? "" : "• Mode semua musim: nama file wajib memuat musim, contoh S02E05\n") +
+    "\nFile yang berhasil diberi reaksi 👍. File yang gagal dibalas beserta alasannya.\n" +
+    "Berlaku untuk semua kualitas. Tekan ✅ Selesai kalau sudah.";
+}
+
+function batchSubtitleKeyboard() {
+  return {inline_keyboard: [
+    [{text: "📊 Cek status", callback_data: "sub_status"}],
+    [{text: "✅ Selesai", callback_data: "sub_done"}],
+    [{text: "❌ Batal", callback_data: "cancel"}]
+  ]};
+}
+
+function subtitleMenuText(title) {
+  return `📺 ${title}\n\nPilih episode, atau tekan 📦 Batch untuk upload banyak subtitle sekaligus:`;
+}
+
+// Simpan satu file subtitle ke semua kualitas sebuah episode.
+async function saveEpisodeSubtitle(env, movieId, ep, doc, ext) {
+  const qualities = QUALITIES.filter(q => ep.videos[q]);
+  const sub = {
+    fileId: doc.file_id,
+    fileName: String(doc.file_name || "") || `subtitle.${ext}`,
+    language: "id",
+    format: ext
+  };
+  for (const q of qualities) {
+    await firebaseRequest(env, "PATCH", `movies/${movieId}/episodes/${ep.id}/videos/${q}`, {subtitle: sub});
+  }
+  return qualities;
+}
+
+// Dipanggil per file (tiap file = satu update webhook, bisa berjalan paralel),
+// jadi TIDAK mengubah state bersama: hasil dibaca ulang dari Firebase saat Selesai.
+async function handleBatchSubtitleFile(msg, env, state) {
+  const chatId = msg.chat.id;
+  const fileName = String(msg.document.file_name || "");
+  const fail = reason => sendMessage(env, chatId, `⚠️ ${fileName || "(tanpa nama)"}\n${reason}`,
+    {reply_parameters: {message_id: msg.message_id, allow_sending_without_reply: true}});
+
+  const ext = (fileName.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+  if (ext !== "srt" && ext !== "vtt") return fail("Format tidak didukung. Gunakan .srt atau .vtt");
+
+  const parsed = parseEpisodeFromFilename(fileName);
+  if (!parsed) return fail("Nomor episode tidak terbaca dari nama file. Sertakan pola seperti S01E03 atau E03, lalu kirim ulang.");
+
+  if (state.season && parsed.season && parsed.season !== state.season) {
+    return fail(`Nama file menyebut musim ${parsed.season}, sedangkan batch ini untuk musim ${state.season}.`);
+  }
+  const season = parsed.season || state.season;
+  if (!season) return fail("Mode semua musim: nama file harus memuat musim dan episode, contoh S01E03.");
+
+  const movie = await getMovie(env, state.movieId);
+  if (!movie) return fail("Series tidak ditemukan lagi di database.");
+  const ep = episodeList(movie).find(e => e.season === season && e.number === parsed.number);
+  if (!ep) return fail(`Musim ${season} Eps ${parsed.number} tidak ada di "${state.movieTitle}".`);
+  if (!QUALITIES.some(q => ep.videos[q])) return fail(`Musim ${season} Eps ${parsed.number} belum punya video, tambahkan dulu lewat /eps.`);
+
+  await saveEpisodeSubtitle(env, state.movieId, ep, msg.document, ext);
+  try {
+    await tg(env, "setMessageReaction", {chat_id: chatId, message_id: msg.message_id, reaction: [{type: "emoji", emoji: "👍"}]});
+  } catch (_) {
+    // Reaksi hanya penanda; hasil tetap bisa dicek lewat "Cek status".
+  }
+}
+
 function subtitleEpisodeKeyboard(eps, page = 0) {
   const PAGE = 24;
   const pages = Math.max(1, Math.ceil(eps.length / PAGE));
   const cur = Math.min(Math.max(0, page), pages - 1);
   const slice = eps.slice(cur * PAGE, cur * PAGE + PAGE);
-  const rows = [];
+  const rows = [[{text: "📦 Batch (banyak episode sekaligus)", callback_data: "sub_batch"}]];
   for (let i = 0; i < slice.length; i += 3) {
     rows.push(slice.slice(i, i + 3).map(e => ({text: `S${e.season} E${e.number}`, callback_data: `sub_ep:${e.id}`})));
   }
@@ -481,6 +617,102 @@ function subtitleEpisodeKeyboard(eps, page = 0) {
   }
   rows.push([{text:"❌ Batal", callback_data:"cancel"}]);
   return {inline_keyboard: rows};
+}
+
+// ---- /list: judul + link video per kualitas (dengan halaman) ------------
+const LIST_PAGE_BUDGET = 3500;   // batas karakter isi per halaman (limit Telegram 4096)
+const LIST_BLOCK_MAX = 1500;
+
+function sortedVideoEntries(videos) {
+  const rank = k => { const i = QUALITIES.indexOf(k); return i < 0 ? 99 : i; };
+  return Object.keys(videos || {})
+    .sort((a, b) => rank(a) - rank(b))
+    .map(k => [k, videos[k]]);
+}
+
+function movieVideoEntries(m) {
+  const out = sortedVideoEntries(migratedVideos(m));
+  if (!out.length && m?.videoUrl) out.push([m.quality || "?", {videoUrl: m.videoUrl}]);
+  return out;
+}
+
+function videoLines(entries, indent) {
+  if (!entries.length) return `${indent}(belum ada video)`;
+  return entries
+    .map(([q, v]) => `${indent}${q}${v?.subtitle ? " 📄" : ""}: ${v?.videoUrl || "(link kosong)"}`)
+    .join("\n");
+}
+
+function buildListBlocks(entries) {
+  const blocks = [];
+  for (const [id, m] of entries) {
+    const title = m?.title || id;
+    if (isSeriesMovie(m)) {
+      const eps = episodeList(m);
+      const seasons = new Set(eps.map(e => e.season)).size;
+      blocks.push({text: `📺 ${title} (${id})\n  Series • ${m.year || "-"} • ${seasons} musim, ${eps.length} eps`, cont: null});
+      const cont = `📺 ${title} (lanjutan)`;
+      for (const e of eps) {
+        blocks.push({
+          text: `  S${e.season} E${e.number}${e.title ? ` — ${e.title}` : ""}\n${videoLines(sortedVideoEntries(e.videos), "    ")}`,
+          cont
+        });
+      }
+    } else {
+      blocks.push({text: `🎬 ${title} (${id})\n  Tahun: ${m?.year || "-"}\n${videoLines(movieVideoEntries(m), "  ")}`, cont: null});
+    }
+  }
+  return blocks;
+}
+
+// Susun blok menjadi halaman. Episode series yang jatuh di awal halaman baru
+// diberi judul series lagi, supaya selalu jelas link ini milik judul apa.
+function paginateBlocks(blocks) {
+  const pages = [];
+  let cur = "";
+  for (const b of blocks) {
+    const text = b.text.length > LIST_BLOCK_MAX ? b.text.slice(0, LIST_BLOCK_MAX) + "…" : b.text;
+    const sep = b.cont ? "\n" : "\n\n";
+    if (cur && cur.length + sep.length + text.length > LIST_PAGE_BUDGET) {
+      pages.push(cur);
+      cur = "";
+    }
+    if (!cur) cur = b.cont ? `${b.cont}\n${text}` : text;
+    else cur += sep + text;
+  }
+  if (cur) pages.push(cur);
+  return pages;
+}
+
+// callback_data Telegram maksimal 64 byte: potong kata kunci pencarian secukupnya.
+function cbQuery(q) {
+  let s = String(q || "").trim();
+  const enc = new TextEncoder();
+  while (enc.encode(s).length > 40) s = s.slice(0, -1);
+  return s;
+}
+
+async function renderList(env, query, page) {
+  const movies = await firebaseRequest(env, "GET", "movies") || {};
+  let entries = Object.entries(movies).filter(([, m]) => m && typeof m === "object");
+  const needle = String(query || "").trim().toLowerCase();
+  if (needle) entries = entries.filter(([id, m]) => String(m.title || id).toLowerCase().includes(needle));
+  if (!entries.length) {
+    return {text: needle ? `📭 Tidak ada judul yang cocok dengan "${query.trim()}".` : "📭 Belum ada film di database."};
+  }
+  entries.sort((a, b) => (Number(b[1]?.addedAt) || 0) - (Number(a[1]?.addedAt) || 0));
+  const pages = paginateBlocks(buildListBlocks(entries));
+  const cur = Math.min(Math.max(0, Number(page) || 0), pages.length - 1);
+  const head = `📚 DAFTAR FILM (${entries.length} judul${needle ? ` • cari: ${query.trim()}` : ""}) — Hal ${cur + 1}/${pages.length}`;
+  const foot = "\n\n📄 = sudah ada subtitle\n🔁 Link expired? /tambah <judul> (film) atau /eps <judul> (series), lalu pilih kualitas bertanda 🔁 untuk menimpa.";
+  const qs = cbQuery(query);
+  const nav = [];
+  if (cur > 0) nav.push({text: "⬅️ Sebelumnya", callback_data: `list:${cur - 1}:${qs}`});
+  if (cur < pages.length - 1) nav.push({text: "Berikutnya ➡️", callback_data: `list:${cur + 1}:${qs}`});
+  return {
+    text: `${head}\n\n${pages[cur]}${foot}`,
+    markup: nav.length ? {inline_keyboard: [nav]} : undefined
+  };
 }
 
 function formatSeriesSummary(s) {
@@ -502,7 +734,7 @@ function formatEpsSummary(s) {
 Series: ${s.movieTitle}
 Musim: ${s.season} • Eps: ${s.number}
 ${s.existing ? "Mode: tambah kualitas ke episode yang sudah ada" : `Judul episode: ${s.epTitle || "-"}\nDurasi: ${s.duration || "-"}`}
-Kualitas: ${s.quality}
+Kualitas: ${s.quality}${s.existingQualities?.includes(s.quality) ? "\n🔁 Link kualitas ini sudah ada dan akan DITIMPA (subtitle tetap dipertahankan)." : ""}
 
 🔗 Video URL: ${s.videoUrl}`;
 }
@@ -550,7 +782,7 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, "🎞️ PILIH KUALITAS VIDEO", {reply_markup:qualityKeyboard()});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
       return;
     }
     if (!state.year) {
@@ -636,7 +868,7 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, "🎞️ PILIH KUALITAS VIDEO", {reply_markup:qualityKeyboard()});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
       return;
     }
     if (!state.existing && state.duration === undefined) {
@@ -645,7 +877,8 @@ async function askNext(env, state, chatId) {
         {reply_markup: skipKeyboard("duration")});
       return;
     }
-    await sendMessage(env, chatId, formatEpsSummary(state), {reply_markup: epsConfirmKeyboard(state.existing)});
+    await sendMessage(env, chatId, formatEpsSummary(state),
+      {reply_markup: epsConfirmKeyboard(state.existing, !!state.existingQualities?.includes(state.quality))});
   } else if (state.mode === "tambah") {
     if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
@@ -660,12 +893,16 @@ async function askNext(env, state, chatId) {
       return;
     }
     if (!state.quality) {
-      await sendMessage(env, chatId, "🎞️ PILIH KUALITAS VIDEO", {reply_markup:qualityKeyboard()});
+      await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", state.existingQualities || [])});
       return;
     }
+    const overwriteAdd = !!state.existingQualities?.includes(state.quality);
     await sendMessage(env, chatId,
-      `🎬 ${state.title}\n\nKualitas: ${state.quality}\n🔗 URL: ${state.videoUrl}\n\nKlik SIMPAN untuk menambahkan kualitas ini.`,
-      {reply_markup:addQualityKeyboard()});
+      `🎬 ${state.title}\n\nKualitas: ${state.quality}\n🔗 URL: ${state.videoUrl}\n\n` +
+      (overwriteAdd
+        ? `🔁 Link ${state.quality} yang lama akan DITIMPA (subtitle tetap dipertahankan). Klik TIMPA LINK untuk melanjutkan.`
+        : "Klik SIMPAN untuk menambahkan kualitas ini."),
+      {reply_markup:addQualityKeyboard(overwriteAdd)});
   }
 }
 
@@ -710,8 +947,8 @@ async function storeUploadedVideo(env, msg, state, chatId) {
     await putState(env, state.userId, state);
 
     await sendMessage(env, chatId,
-      `✅ Video berhasil disimpan ke Teleplay.\n\n🎞️ Sekarang pilih kualitas video:`,
-      {reply_markup:qualityKeyboard()}
+      `✅ Video berhasil disimpan ke Teleplay.\n\n${qualityPromptText(state)}`,
+      {reply_markup:qualityKeyboard("", state.existingQualities || [])}
     );
     return true;
   } catch (e) {
@@ -797,15 +1034,7 @@ async function handleAdminText(msg, env) {
           return;
         }
         const hadEpSubtitle = epQualities.some(q => ep.videos[q].subtitle);
-        const epSub = {
-          fileId: msg.document.file_id,
-          fileName: fileName || `subtitle.${ext}`,
-          language: "id",
-          format: ext
-        };
-        for (const q of epQualities) {
-          await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${state.episodeId}/videos/${q}`, {subtitle: epSub});
-        }
+        await saveEpisodeSubtitle(env, state.movieId, ep, msg.document, ext);
         await delState(env, userId);
         await sendMessage(env, chatId, hadEpSubtitle
           ? `✅ Subtitle ${state.episodeLabel} berhasil diperbarui (semua kualitas).`
@@ -834,6 +1063,10 @@ async function handleAdminText(msg, env) {
         : "✅ Subtitle berhasil disimpan (semua kualitas).");
       return;
     }
+    if (state?.mode === "subtitle" && state.step === "await_batch_files") {
+      await handleBatchSubtitleFile(msg, env, state);
+      return;
+    }
     // Document di luar alur /subtitle: abaikan, jangan ganggu fitur lain.
     return;
   }
@@ -851,8 +1084,8 @@ async function handleAdminText(msg, env) {
       "Series:\n" +
       "4. /series <judul> — simpan series baru (lalu lanjut tambah episode)\n" +
       "5. /eps <judul series> — tambah episode, atau kualitas episode yang sudah ada\n\n" +
-      "/subtitle <judul> — upload subtitle .srt/.vtt (film atau episode series)\n" +
-      "/list — daftar film\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
+      "/subtitle <judul> — upload subtitle .srt/.vtt (film, episode series, atau 📦 batch banyak episode)\n" +
+      "/list — daftar film + link video (halaman)\n/list <kata> — cari judul tertentu\n/batal — batalkan proses\n/id — lihat Telegram ID\n/ping — tes bot");
     return;
   }
   if (text === "/ping") {
@@ -865,26 +1098,9 @@ async function handleAdminText(msg, env) {
     return;
   }
 
-  if (text === "/list") {
-    const movies = await firebaseRequest(env, "GET", "movies") || {};
-    const entries = Object.entries(movies);
-    if (!entries.length) {
-      await sendMessage(env, chatId, "📭 Belum ada film di database.");
-      return;
-    }
-    entries.sort((a,b) => (Number(b[1]?.addedAt)||0) - (Number(a[1]?.addedAt)||0));
-    const top = entries.slice(0, 20);
-    const lines = top.map(([id, m]) => {
-      if (isSeriesMovie(m)) {
-        const eps = episodeList(m);
-        const seasons = new Set(eps.map(e => e.season)).size;
-        return `• 📺 ${m.title || id} (${id})\n  Tahun: ${m.year || "-"} | Series: ${seasons} musim, ${eps.length} eps`;
-      }
-      const qualities = m.videos ? Object.keys(m.videos).join(", ") : (m.quality || "-");
-      return `• ${m.title || id} (${id})\n  Tahun: ${m.year || "-"} | Kualitas: ${qualities || "-"}`;
-    });
-    const extra = entries.length > 20 ? `\n\n...dan ${entries.length - 20} film lainnya.` : "";
-    await sendMessage(env, chatId, `📚 DAFTAR FILM (${entries.length})\n\n${lines.join("\n\n")}${extra}`);
+  if (text === "/list" || text.startsWith("/list ")) {
+    const r = await renderList(env, text.slice(5), 0);
+    await sendMessage(env, chatId, r.text, {reply_markup: r.markup, link_preview_options: {is_disabled: true}});
     return;
   }
 
@@ -974,9 +1190,10 @@ async function handleAdminText(msg, env) {
     if (isSeriesMovie(found.movie)) {
       return sendMessage(env, chatId, `📺 "${found.movie.title}" adalah series. Gunakan /eps ${found.movie.title} untuk menambah episode atau kualitas episode.`);
     }
-    const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId, step:"await_source"};
+    const state = {userId, mode:"tambah", title:found.movie.title, movieId:found.id, createdAt:Date.now(), chatId, step:"await_source",
+      existingQualities: getAvailableQualities(found.movie)};
     await putState(env, userId, state);
-    await sendMessage(env, chatId, `🎬 Tambah Kualitas\n\nFilm: ${found.movie.title}\n\nPilih sumber video:`, {reply_markup:videoSourceKeyboard("tambah")});
+    await sendMessage(env, chatId, `🎬 Tambah Kualitas\n\nFilm: ${found.movie.title}\nKualitas saat ini: ${state.existingQualities.join(", ") || "-"}\n(Pilih kualitas yang sudah ada untuk menimpa link yang expired.)\n\nPilih sumber video:`, {reply_markup:videoSourceKeyboard("tambah")});
     return;
   }
 
@@ -995,7 +1212,7 @@ async function handleAdminText(msg, env) {
         userId, mode: "subtitle", chatId, isSeries: true,
         movieId: found.id, movieTitle: found.movie.title, createdAt: Date.now()
       });
-      await sendMessage(env, chatId, `📺 ${found.movie.title}\n\nPilih episode:`,
+      await sendMessage(env, chatId, subtitleMenuText(found.movie.title),
         {reply_markup: subtitleEpisodeKeyboard(eps, 0)});
       return;
     }
@@ -1141,6 +1358,16 @@ async function handleCallback(q, env) {
   const msg = q.message;
   const userId = String(q.from.id);
   const chatId = msg.chat.id;
+  // Navigasi halaman /list tidak butuh sesi/state.
+  if (data.startsWith("list:")) {
+    const m = data.match(/^list:(\d+):?([\s\S]*)$/);
+    await answerCallback(env, q.id);
+    const r = await renderList(env, m?.[2] || "", Number(m?.[1] || 0));
+    await editMessage(env, chatId, msg.message_id, r.text,
+      {reply_markup: r.markup, link_preview_options: {is_disabled: true}});
+    return;
+  }
+
   const state = await getState(env, userId);
 
   if (!state) {
@@ -1207,24 +1434,16 @@ async function handleCallback(q, env) {
 
   if (data.startsWith("q:")) {
     const chosen = data.slice(2);
+    if (!QUALITIES.includes(chosen)) return answerCallback(env, q.id, "Kualitas tidak valid.");
 
-    if (state.mode === "eps" && state.existing && state.existingQualities?.includes(chosen)) {
-      await answerCallback(env, q.id, `Kualitas ${chosen} sudah ada untuk episode ini. Pilih kualitas lain.`);
-      return;
-    }
-
-    if (state.mode === "tambah" && state.movieId) {
-      const movie = await getMovie(env, state.movieId);
-      if (movie && migratedVideos(movie)[chosen]) {
-        await answerCallback(env, q.id, `Kualitas ${chosen} sudah ada. Pilih kualitas lain.`);
-        return;
-      }
-    }
-
+    // Kualitas yang sudah ada BOLEH dipilih: link lama akan ditimpa saat disimpan.
     state.quality = chosen;
     await putState(env, userId, state);
-    await answerCallback(env, q.id, `Kualitas ${state.quality}`);
-    await editMessage(env, chatId, msg.message_id, `🎞️ Kualitas dipilih: ${state.quality}\n\nKlik Lanjut.`, {reply_markup:qualityKeyboard(state.quality)});
+    const willOverwrite = !!state.existingQualities?.includes(chosen);
+    await answerCallback(env, q.id, willOverwrite ? `Kualitas ${chosen} (timpa link lama)` : `Kualitas ${chosen}`);
+    await editMessage(env, chatId, msg.message_id,
+      `🎞️ Kualitas dipilih: ${chosen}${willOverwrite ? "\n🔁 Link lama akan DITIMPA." : ""}\n\nKlik Lanjut.`,
+      {reply_markup:qualityKeyboard(chosen, state.existingQualities || [])});
     return;
   }
 
@@ -1332,14 +1551,10 @@ async function handleCallback(q, env) {
     const video = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
     const label = `Musim ${state.season} Eps ${state.number}`;
 
+    const overwrite = !!(found && found.videos[state.quality]);
     if (found) {
-      if (found.videos[state.quality]) {
-        await answerCallback(env, q.id, "Kualitas itu sudah ada.");
-        await editMessage(env, chatId, msg.message_id, `⚠️ Kualitas ${state.quality} sudah ada untuk ${label}. Data lama tidak ditimpa.`);
-        await delState(env, userId);
-        return;
-      }
-      await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${epId}/videos`, {[state.quality]: video});
+      // PATCH hanya videoUrl+provider: subtitle yang sudah menempel di kualitas ini tetap ada.
+      await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${epId}/videos/${state.quality}`, video);
     } else {
       const ep = {season: state.season, number: state.number, videos: {[state.quality]: video}, addedAt: Date.now()};
       if (state.epTitle) ep.title = state.epTitle;
@@ -1354,7 +1569,7 @@ async function handleCallback(q, env) {
     });
     await answerCallback(env, q.id, "Tersimpan.");
     await editMessage(env, chatId, msg.message_id,
-      `✅ ${found ? "KUALITAS DITAMBAHKAN" : "EPISODE DISIMPAN"}\n\n📺 ${state.movieTitle}\n${label}${state.epTitle ? ` — ${state.epTitle}` : ""}\n🎞️ Kualitas: ${state.quality}\n🔗 ${state.videoUrl}`,
+      `${overwrite ? "🔁 LINK DITIMPA" : (found ? "✅ KUALITAS DITAMBAHKAN" : "✅ EPISODE DISIMPAN")}\n\n📺 ${state.movieTitle}\n${label}${state.epTitle ? ` — ${state.epTitle}` : ""}\n🎞️ Kualitas: ${state.quality}\n🔗 ${state.videoUrl}`,
       {reply_markup: afterEpsKeyboard(nextNumber)});
     return;
   }
@@ -1383,8 +1598,64 @@ async function handleCallback(q, env) {
     const movie = await getMovie(env, state.movieId);
     const eps = episodeList(movie).filter(e => QUALITIES.some(qq => e.videos[qq]));
     await answerCallback(env, q.id);
-    await editMessage(env, chatId, msg.message_id, `📺 ${state.movieTitle}\n\nPilih episode:`,
+    await editMessage(env, chatId, msg.message_id, subtitleMenuText(state.movieTitle),
       {reply_markup: subtitleEpisodeKeyboard(eps, Number(data.slice(7)) || 0)});
+    return;
+  }
+
+  if (data === "sub_batch") {
+    if (state.mode !== "subtitle" || !state.isSeries) return answerCallback(env, q.id, "Sesi subtitle tidak valid.");
+    const movie = await getMovie(env, state.movieId);
+    const eps = episodeList(movie).filter(e => QUALITIES.some(qq => e.videos[qq]));
+    const seasons = [...new Set(eps.map(e => e.season))].sort((a, b) => a - b);
+    if (!seasons.length) return answerCallback(env, q.id, "Belum ada episode berkualitas video.");
+    if (seasons.length === 1) {
+      state.season = seasons[0];
+      state.step = "await_batch_files";
+      delete state.episodeId;
+      await putState(env, userId, state);
+      await answerCallback(env, q.id, "Mode batch");
+      await editMessage(env, chatId, msg.message_id, batchSubtitlePrompt(state), {reply_markup: batchSubtitleKeyboard()});
+      return;
+    }
+    const rows = [];
+    for (let i = 0; i < seasons.length; i += 4) {
+      rows.push(seasons.slice(i, i + 4).map(n => ({text: `Musim ${n}`, callback_data: `sub_bs:${n}`})));
+    }
+    rows.push([{text: "Semua musim (nama file wajib SxxExx)", callback_data: "sub_bs:all"}]);
+    rows.push([{text: "❌ Batal", callback_data: "cancel"}]);
+    await answerCallback(env, q.id);
+    await editMessage(env, chatId, msg.message_id, `📦 BATCH SUBTITLE — ${state.movieTitle}\n\nPilih musim:`, {reply_markup: {inline_keyboard: rows}});
+    return;
+  }
+
+  if (data.startsWith("sub_bs:")) {
+    if (state.mode !== "subtitle" || !state.isSeries) return answerCallback(env, q.id, "Sesi subtitle tidak valid.");
+    const pick = data.slice(7);
+    const n = pick === "all" ? 0 : Number(pick);
+    if (pick !== "all" && (!Number.isInteger(n) || n < 1 || n > 99)) return answerCallback(env, q.id, "Musim tidak valid.");
+    state.season = n;
+    state.step = "await_batch_files";
+    delete state.episodeId;
+    await putState(env, userId, state);
+    await answerCallback(env, q.id, "Mode batch");
+    await editMessage(env, chatId, msg.message_id, batchSubtitlePrompt(state), {reply_markup: batchSubtitleKeyboard()});
+    return;
+  }
+
+  if (data === "sub_status" || data === "sub_done") {
+    if (state.mode !== "subtitle" || state.step !== "await_batch_files") return answerCallback(env, q.id, "Sesi batch tidak valid.");
+    const movie = await getMovie(env, state.movieId);
+    if (!movie) return answerCallback(env, q.id, "Series tidak ditemukan.");
+    const summary = batchSubtitleSummary(movie, state.season);
+    if (data === "sub_status") {
+      await answerCallback(env, q.id, "Status");
+      await sendMessage(env, chatId, `📊 STATUS SUBTITLE — ${state.movieTitle}\n\n${summary}`);
+      return;
+    }
+    await delState(env, userId);
+    await answerCallback(env, q.id, "Selesai");
+    await editMessage(env, chatId, msg.message_id, `✅ BATCH SUBTITLE SELESAI — ${state.movieTitle}\n\n${summary}`);
     return;
   }
 
@@ -1497,20 +1768,23 @@ async function handleCallback(q, env) {
     if (!state.movieId || !state.videoUrl || !state.quality) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
-    if (migratedVideos(movie)[state.quality]) {
-      await answerCallback(env, q.id, "Kualitas itu sudah ada.");
-      await editMessage(env, chatId, msg.message_id, `⚠️ Kualitas ${state.quality} sudah ada untuk film ini. Data lama tidak ditimpa.`);
-      await delState(env, userId);
-      return;
-    }
     const videos = migratedVideos(movie);
-    videos[state.quality] = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
+    const old = videos[state.quality];
+    const overwrite = !!old;
+    // Spread data lama supaya subtitle tidak hilang; hanya link & provider yang diganti.
+    videos[state.quality] = {...(old || {}), videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
     const patch = {videos};
-    if (!movie.videoUrl) patch.videoUrl = state.videoUrl; // hanya isi jika film lama belum punya videoUrl utama
+    // videoUrl utama: isi jika kosong, atau ganti jika itu memang link kualitas yang ditimpa.
+    if (!movie.videoUrl || (overwrite && (movie.quality === state.quality || movie.videoUrl === old.videoUrl))) {
+      patch.videoUrl = state.videoUrl;
+    }
     await firebaseRequest(env, "PATCH", `movies/${state.movieId}`, patch);
     await delState(env, userId);
-    await answerCallback(env, q.id, "Kualitas berhasil ditambahkan.");
-    await editMessage(env, chatId, msg.message_id, `✅ Kualitas ${state.quality} berhasil ditambahkan ke ${movie.title}.\n🔗 ${state.videoUrl}`);
+    await answerCallback(env, q.id, overwrite ? "Link berhasil ditimpa." : "Kualitas berhasil ditambahkan.");
+    await editMessage(env, chatId, msg.message_id, overwrite
+      ? `🔁 Link ${state.quality} untuk ${movie.title} berhasil DITIMPA.\n\nLama: ${old.videoUrl || "-"}\nBaru: ${state.videoUrl}`
+      : `✅ Kualitas ${state.quality} berhasil ditambahkan ke ${movie.title}.\n🔗 ${state.videoUrl}`,
+      {link_preview_options: {is_disabled: true}});
     return;
   }
 }

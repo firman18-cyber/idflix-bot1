@@ -415,8 +415,9 @@ function moreResolutionKeyboard(mode) {
 
 function videoSourceKeyboard(mode) {
   return {inline_keyboard:[
-    [{text:"🔗 Link Video", callback_data:`source:link:${mode}`}],
-    [{text:"🎥 Upload Video", callback_data:`source:upload:${mode}`}],
+    [{text:"🎥 Telegram / Teleplay (Upload)", callback_data:`source:upload:${mode}`}],
+    [{text:"☁️ Streamtape (File ID)", callback_data:`source:streamtape:${mode}`}],
+    [{text:"🔗 Link pihak ketiga (MP4 / M3U8 / URL)", callback_data:`source:link:${mode}`}],
     [{text:"❌ Batal", callback_data:"cancel"}]
   ]};
 }
@@ -767,7 +768,7 @@ async function setEpisodeNumber(env, state, n) {
   state.existingQualities = found ? Object.keys(found.videos) : [];
   state.epId = found ? found.id : episodeId(state.season, n);
   state.epTitle = found ? found.title : undefined;
-  for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "quality", "duration"]) delete state[k];
+  for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "streamtapeFileId", "quality", "duration"]) delete state[k];
   state.step = "await_source";
 }
 
@@ -789,6 +790,10 @@ ${pendingItems(s).length ? itemLines(pendingItems(s)) : s.videoUrl}
 
 async function askNext(env, state, chatId) {
   if (state.mode === "simpan") {
+    if (state.sourceType === "streamtape" && !state.streamtapeFileId) {
+      await sendMessage(env, chatId, "☁️ Kirim Streamtape File ID (bukan URL tapecontent yang sementara).");
+      return;
+    }
     if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
       return;
@@ -873,6 +878,10 @@ async function askNext(env, state, chatId) {
         {reply_markup: skipKeyboard("title")});
       return;
     }
+    if (state.sourceType === "streamtape" && !state.streamtapeFileId) {
+      await sendMessage(env, chatId, "☁️ Kirim Streamtape File ID (bukan URL tapecontent yang sementara).");
+      return;
+    }
     if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video episode (harus diawali https://).");
       return;
@@ -900,6 +909,10 @@ async function askNext(env, state, chatId) {
     await sendMessage(env, chatId, formatEpsSummary(state),
       {reply_markup: epsConfirmKeyboard(state.existing, !!state.existingQualities?.includes(state.quality))});
   } else if (state.mode === "tambah") {
+    if (state.sourceType === "streamtape" && !state.streamtapeFileId) {
+      await sendMessage(env, chatId, "☁️ Kirim Streamtape File ID (bukan URL tapecontent yang sementara).");
+      return;
+    }
     if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video kualitas tambahan (harus diawali https://).");
       return;
@@ -1315,6 +1328,24 @@ async function handleAdminText(msg, env) {
     } else if (!state.sourceType) {
       await sendMessage(env, chatId, "🎬 Pilih sumber video terlebih dahulu.", {reply_markup:videoSourceKeyboard("eps")});
       return;
+    } else if (state.sourceType === "streamtape" && state.step === "await_streamtape_id" && !state.streamtapeFileId) {
+      const input = text.trim();
+      let fileId = input;
+      try {
+        const parsed = new URL(input);
+        if (!/(^|\.)streamtape\.com$/i.test(parsed.hostname)) throw new Error("host");
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        fileId = parts[0] === "v" || parts[0] === "e" ? (parts[1] || "") : "";
+      } catch (_) {}
+      if (!/^[A-Za-z0-9_-]{8,}$/.test(fileId)) {
+        await sendMessage(env, chatId, "❌ File ID tidak valid. Kirim ID Streamtape atau URL halaman file Streamtape.");
+        return;
+      }
+      const base = String(env.PUBLIC_WORKER_URL || "https://idflix-bot1.firman-uke29.workers.dev").trim().replace(/\/+$/, "");
+      state.streamtapeFileId = fileId;
+      state.videoProvider = "streamtape";
+      state.videoUrl = `${base}/streamtape/${encodeURIComponent(fileId)}`;
+      state.step = "await_quality";
     } else if (state.sourceType === "link" && state.step === "await_video_url" && !state.videoUrl) {
       if (!isValidVideoUrl(text)) {
         await sendMessage(env, chatId, "❌ URL tidak valid. URL harus diawali https:// dan berupa link yang valid.\n\n🔗 Kirim link video.");
@@ -1339,6 +1370,29 @@ async function handleAdminText(msg, env) {
 
   if ((state.mode === "simpan" || state.mode === "tambah") && !state.sourceType) {
     await sendMessage(env, chatId, "🎬 Pilih sumber video terlebih dahulu.", {reply_markup:videoSourceKeyboard(state.mode)});
+    return;
+  }
+
+  if ((state.mode === "simpan" || state.mode === "tambah" || state.mode === "eps") &&
+      state.sourceType === "streamtape" && state.step === "await_streamtape_id" && !state.streamtapeFileId) {
+    let fileId = text.trim();
+    try {
+      const parsed = new URL(fileId);
+      if (!/(^|\.)streamtape\.com$/i.test(parsed.hostname)) throw new Error("host");
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      fileId = parts[0] === "v" || parts[0] === "e" ? (parts[1] || "") : "";
+    } catch (_) {}
+    if (!/^[A-Za-z0-9_-]{8,}$/.test(fileId)) {
+      await sendMessage(env, chatId, "❌ File ID tidak valid. Kirim ID Streamtape atau URL halaman file Streamtape.");
+      return;
+    }
+    const base = String(env.PUBLIC_WORKER_URL || "https://idflix-bot1.firman-uke29.workers.dev").trim().replace(/\/+$/, "");
+    state.streamtapeFileId = fileId;
+    state.videoProvider = "streamtape";
+    state.videoUrl = `${base}/streamtape/${encodeURIComponent(fileId)}`;
+    state.step = "await_quality";
+    await putState(env, userId, state);
+    await sendMessage(env, chatId, `✅ Streamtape File ID diterima: ${fileId}\nLink akan dibuat ulang melalui API saat film diputar.\n\n${qualityPromptText(state)}`, {reply_markup:qualityKeyboard("", markedQualities(state))});
     return;
   }
 
@@ -1418,26 +1472,29 @@ async function handleCallback(q, env) {
       return answerCallback(env, q.id, "Sesi sumber video tidak valid.");
     }
 
-    if (sourceType !== "link" && sourceType !== "upload") {
+    if (!["link", "upload", "streamtape"].includes(sourceType)) {
       return answerCallback(env, q.id, "Sumber video tidak valid.");
     }
 
     state.sourceType = sourceType;
-    state.step = sourceType === "upload" ? "await_video_upload" : "await_video_url";
+    state.step = sourceType === "upload" ? "await_video_upload" : sourceType === "streamtape" ? "await_streamtape_id" : "await_video_url";
     delete state.videoUrl;
     delete state.videoMessageId;
     delete state.videoProvider;
+    delete state.streamtapeFileId;
     delete state.quality;
     await putState(env, userId, state);
     await answerCallback(env, q.id, sourceType === "upload" ? "Upload Video dipilih" : "Link Video dipilih");
     await editMessage(env, chatId, msg.message_id,
       sourceType === "upload"
-        ? "🎥 Upload Video dipilih.\n\nKirim video Telegram sekarang."
-        : (state.mode === "simpan"
-          ? "🔗 Link Video dipilih.\n\nKirim URL video (harus diawali https://)."
-          : state.mode === "eps"
-            ? "🔗 Link Video dipilih.\n\nKirim URL video episode (harus diawali https://)."
-            : "🔗 Link Video dipilih.\n\nKirim URL video kualitas tambahan (harus diawali https://).")
+        ? "🎥 Upload Video dipilih.\n\nKirim video Telegram sekarang; video akan disimpan melalui Teleplay/Blitz."
+        : sourceType === "streamtape"
+          ? "☁️ Streamtape dipilih.\n\nKirim File ID Streamtape (ambil dari link halaman file /v/ atau panel akun). Jangan kirim URL tapecontent yang sudah expired."
+          : (state.mode === "simpan"
+            ? "🔗 Link pihak ketiga dipilih.\n\nKirim URL video HTTPS (MP4, M3U8, atau URL provider kompatibel)."
+            : state.mode === "eps"
+              ? "🔗 Link pihak ketiga dipilih.\n\nKirim URL video episode HTTPS."
+              : "🔗 Link pihak ketiga dipilih.\n\nKirim URL video kualitas tambahan HTTPS.")
     );
     return;
   }
@@ -1479,7 +1536,7 @@ async function handleCallback(q, env) {
     if (state.mode === "simpan" || state.mode === "tambah") {
       // Kumpulkan resolusi ini, lalu tawarkan menambah resolusi lain sebelum menyimpan.
       const items = pendingItems(state).filter(i => i.quality !== state.quality);
-      items.push({quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"});
+      items.push({quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ...(state.streamtapeFileId ? {streamtapeFileId: state.streamtapeFileId} : {})});
       state.items = items;
       for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "quality"]) delete state[k];
       state.step = "after_resolution";
@@ -1616,7 +1673,7 @@ async function handleCallback(q, env) {
     if (!movie) return answerCallback(env, q.id, "Series tidak ditemukan.");
     const found = episodeList(movie).find(e => e.season === state.season && e.number === state.number);
     const epId = found ? found.id : episodeId(state.season, state.number);
-    const video = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
+    const video = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ...(state.streamtapeFileId ? {streamtapeFileId: state.streamtapeFileId} : {})};
     const label = `Musim ${state.season} Eps ${state.number}`;
 
     const overwrite = !!(found && found.videos[state.quality]);
@@ -1762,9 +1819,9 @@ async function handleCallback(q, env) {
     await answerCallback(env, q.id, "Menyimpan film...");
     const items = pendingItems(state).length
       ? pendingItems(state)
-      : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}];
+      : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ...(state.streamtapeFileId ? {streamtapeFileId: state.streamtapeFileId} : {})}];
     const videosMap = {};
-    for (const it of items) videosMap[it.quality] = {videoUrl: it.videoUrl, provider: it.provider || "custom"};
+    for (const it of items) videosMap[it.quality] = {videoUrl: it.videoUrl, provider: it.provider || "custom", ...(it.streamtapeFileId ? {streamtapeFileId: it.streamtapeFileId} : {})};
     const id = await uniqueMovieId(env, state.title);
     const movie = {
       type: "movie",
@@ -1840,7 +1897,7 @@ async function handleCallback(q, env) {
   if (data === "confirm_add") {
     const items = pendingItems(state).length
       ? pendingItems(state)
-      : (state.videoUrl && state.quality ? [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}] : []);
+      : (state.videoUrl && state.quality ? [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ...(state.streamtapeFileId ? {streamtapeFileId: state.streamtapeFileId} : {})}] : []);
     if (!state.movieId || !items.length) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
@@ -1851,7 +1908,7 @@ async function handleCallback(q, env) {
     for (const it of items) {
       const old = videos[it.quality];
       // Spread data lama supaya subtitle tidak hilang; hanya link & provider yang diganti.
-      videos[it.quality] = {...(old || {}), videoUrl: it.videoUrl, provider: it.provider || "custom"};
+      videos[it.quality] = {...(old || {}), videoUrl: it.videoUrl, provider: it.provider || "custom", ...(it.streamtapeFileId ? {streamtapeFileId: it.streamtapeFileId} : {})};
       if (old) {
         overwritten.push({...it, oldUrl: old.videoUrl || "-"});
         // videoUrl utama ikut diganti jika itu memang link kualitas yang ditimpa.
@@ -2083,6 +2140,42 @@ async function serveSubtitle(request, env) {
   });
 }
 
+// Streamtape resolver: kredensial hanya berada di Worker secret.
+// Setiap request membuat ticket baru dan mengembalikan redirect ke URL CDN terbaru.
+async function resolveStreamtape(request, env) {
+  const headers = new Headers(corsHeaders());
+  headers.set("Cache-Control", "no-store, max-age=0");
+  headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  const fileId = decodeURIComponent(new URL(request.url).pathname.slice("/streamtape/".length));
+  if (!/^[A-Za-z0-9_-]{8,}$/.test(fileId)) return new Response("Invalid Streamtape File ID", {status:400, headers});
+  if (!env.STREAMTAPE_LOGIN || !env.STREAMTAPE_KEY) return new Response("Streamtape API belum dikonfigurasi", {status:503, headers});
+  try {
+    const params = new URLSearchParams({file:fileId, login:env.STREAMTAPE_LOGIN, key:env.STREAMTAPE_KEY});
+    const ticketResponse = await fetch(`https://api.streamtape.com/file/dlticket?${params}`);
+    const ticketData = await ticketResponse.json();
+    if (!ticketResponse.ok || ticketData?.status !== 200 || !ticketData?.result?.ticket) {
+      return new Response(`Streamtape ticket error (${ticketData?.status || ticketResponse.status})`, {status:502, headers});
+    }
+    const wait = Math.min(Math.max(Number(ticketData.result.wait_time) || 0, 0), 15);
+    if (wait) await new Promise(resolve => setTimeout(resolve, wait * 1000));
+    const dlParams = new URLSearchParams({file:fileId, ticket:ticketData.result.ticket});
+    const linkResponse = await fetch(`https://api.streamtape.com/file/dl?${dlParams}`);
+    const linkData = await linkResponse.json();
+    const target = String(linkData?.result?.url || "");
+    if (!linkResponse.ok || linkData?.status !== 200 || !target) {
+      return new Response(`Streamtape link error (${linkData?.status || linkResponse.status})`, {status:502, headers});
+    }
+    const parsed = new URL(target);
+    if (parsed.protocol !== "https:" || !/(^|\.)tapecontent\.net$/i.test(parsed.hostname)) {
+      return new Response("Streamtape returned an unexpected media host", {status:502, headers});
+    }
+    headers.set("Location", target);
+    return new Response(null, {status:302, headers});
+  } catch (error) {
+    return new Response("Streamtape resolver failed", {status:502, headers});
+  }
+}
+
 async function diagnostic(env) {
   const envInfo = {
     BOT_TOKEN: !!env.BOT_TOKEN,
@@ -2090,7 +2183,10 @@ async function diagnostic(env) {
     TELEGRAM_CHAT_ID: !!env.TELEGRAM_CHAT_ID,
     TOPIC_KV: !!env.TOPIC_KV,
     FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
-    FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY
+    FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY,
+    STREAMTAPE_LOGIN: !!env.STREAMTAPE_LOGIN,
+    STREAMTAPE_KEY: !!env.STREAMTAPE_KEY,
+    PUBLIC_WORKER_URL: !!env.PUBLIC_WORKER_URL
   };
 
   let webhook;
@@ -2121,6 +2217,10 @@ export default {
           "Access-Control-Max-Age": "86400"
         }
       });
+    }
+
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/streamtape/")) {
+      return resolveStreamtape(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/diagnostic") {

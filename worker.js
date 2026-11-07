@@ -453,17 +453,40 @@ async function streamtapeApi(path, params, env, {auth = true} = {}) {
     u.searchParams.set('login', env.STREAMTAPE_LOGIN);
     u.searchParams.set('key', env.STREAMTAPE_KEY);
   }
-  const r = await fetch(u.toString(), {headers:{'accept':'application/json'}});
-  const data = await r.json().catch(() => null);
-  if (!r.ok || !data || Number(data.status) !== 200) {
-    const code = Number(data?.status || r.status || 502);
-    throw new Error(`Streamtape API ${code}: ${String(data?.msg || r.statusText || 'request gagal').slice(0,240)}`);
+  // Streamtape sering membalas 5xx/429 ("Too high server load") saat padat.
+  // Coba ulang dengan backoff + jitter; error 4xx lain (file hilang, key salah) langsung gagal.
+  const delays = [500, 1200, 2500];
+  let lastErr;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      const r = await fetch(u.toString(), {headers:{'accept':'application/json'}});
+      const data = await r.json().catch(() => null);
+      if (r.ok && data && Number(data.status) === 200) return data.result;
+      const code = Number(data?.status || r.status || 502);
+      lastErr = new Error(`Streamtape API ${code}: ${String(data?.msg || r.statusText || 'request gagal').slice(0,240)}`);
+      lastErr.retryable = code >= 500 || code === 429;
+    } catch (e) {
+      lastErr = e; // error jaringan/timeout: layak dicoba lagi
+      lastErr.retryable = true;
+    }
+    if (!lastErr.retryable || attempt === delays.length) break;
+    await new Promise(res => setTimeout(res, delays[attempt] + Math.random() * 300));
   }
-  return data.result;
+  throw lastErr;
 }
 
 async function streamtapeRedirect(request, env, fileId) {
   if (!/^[A-Za-z0-9_-]{6,80}$/.test(fileId)) return json({ok:false,error:'File ID tidak valid.'},400);
+  // Cache singkat hasil resolve (120 dtk) agar seek/reload player tidak memukul API lagi.
+  const cache = (typeof caches !== 'undefined') ? caches.default : null;
+  const cacheKey = new Request(`https://streamtape-cache.invalid/${encodeURIComponent(fileId)}`);
+  try {
+    const hit = cache && await cache.match(cacheKey);
+    if (hit) {
+      const loc = await hit.text();
+      return new Response(null, {status:302, headers:{'Location':loc,'Cache-Control':'no-store','Access-Control-Allow-Origin':'*','Vary':'Origin'}});
+    }
+  } catch {}
   try {
     // Streamtape mendokumentasikan login/key sebagai opsional untuk dlticket.
     // Gunakan request tanpa kredensial terlebih dahulu agar Secret tidak ikut
@@ -480,12 +503,20 @@ async function streamtapeRedirect(request, env, fileId) {
     if (targetUrl.protocol !== 'https:' || !/(^|\.)tapecontent\.net$/i.test(targetUrl.hostname)) {
       return json({ok:false,error:'Host URL streaming tidak sesuai.'},502);
     }
+    try {
+      if (cache) await cache.put(cacheKey, new Response(targetUrl.toString(), {headers:{'Cache-Control':'max-age=120'}}));
+    } catch {}
     return new Response(null, {
       status:302,
       headers:{'Location':targetUrl.toString(),'Cache-Control':'no-store, no-cache, must-revalidate','Access-Control-Allow-Origin':'*','Vary':'Origin'}
     });
   } catch (e) {
-    return json({ok:false,error:String(e?.message || e)},502);
+    const msg = String(e?.message || e);
+    const busy = /Streamtape API (5\d\d|429)/.test(msg);
+    return new Response(JSON.stringify({ok:false,error:msg,retryable:busy}), {
+      status: busy ? 503 : 502,
+      headers:{'Content-Type':'application/json','Retry-After':'5','Access-Control-Allow-Origin':'*'}
+    });
   }
 }
 

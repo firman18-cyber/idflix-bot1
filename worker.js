@@ -446,7 +446,10 @@ function streamtapeProxyUrl(request, fileId) {
 }
 
 async function streamtapeApi(path, params, env, {auth = true} = {}) {
-  const u = new URL(`https://api.streamtape.com${path}`);
+  // Host API bisa diganti lewat var STREAMTAPE_API_HOST (lihat "API Server" di Account Infos Streamtape).
+  const host = String(env.STREAMTAPE_API_HOST || 'api.streamtape.com').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+  if (!/^[a-z0-9.-]+\.streamtape\.com$/i.test(host)) throw new Error('STREAMTAPE_API_HOST tidak valid (harus *.streamtape.com).');
+  const u = new URL(`https://${host}${path}`);
   for (const [k,v] of Object.entries(params || {})) u.searchParams.set(k, String(v));
   if (auth) {
     if (!env.STREAMTAPE_LOGIN || !env.STREAMTAPE_KEY) throw new Error('STREAMTAPE_LOGIN dan STREAMTAPE_KEY belum dikonfigurasi.');
@@ -491,7 +494,14 @@ async function streamtapeRedirect(request, env, fileId) {
     // Streamtape mendokumentasikan login/key sebagai opsional untuk dlticket.
     // Gunakan request tanpa kredensial terlebih dahulu agar Secret tidak ikut
     // dikirim pada endpoint ticket; autentikasi tetap dipakai untuk file/info.
-    const ticketData = await streamtapeApi('/file/dlticket', {file:fileId}, env, {auth:false});
+    let ticketData;
+    try {
+      ticketData = await streamtapeApi('/file/dlticket', {file:fileId}, env, {auth:false});
+    } catch (e) {
+      // Fallback: coba sekali dengan kredensial akun (kadang diprioritaskan saat server padat).
+      if (!/Streamtape API (5\d\d|429)/.test(String(e?.message)) || !env.STREAMTAPE_LOGIN || !env.STREAMTAPE_KEY) throw e;
+      ticketData = await streamtapeApi('/file/dlticket', {file:fileId}, env, {auth:true});
+    }
     if (!ticketData?.ticket) return json({ok:false,error:'Streamtape tidak memberikan download ticket.'},502);
     const wait = Math.max(0, Math.min(15, Number(ticketData.wait_time) || 0));
     if (wait) await new Promise(resolve => setTimeout(resolve, wait * 1000));

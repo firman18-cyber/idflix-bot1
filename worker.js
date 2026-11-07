@@ -445,12 +445,14 @@ function streamtapeProxyUrl(request, fileId) {
   return `${base}/streamtape/${encodeURIComponent(fileId)}`;
 }
 
-async function streamtapeApi(path, params, env) {
-  if (!env.STREAMTAPE_LOGIN || !env.STREAMTAPE_KEY) throw new Error('STREAMTAPE_LOGIN dan STREAMTAPE_KEY belum dikonfigurasi.');
+async function streamtapeApi(path, params, env, {auth = true} = {}) {
   const u = new URL(`https://api.streamtape.com${path}`);
   for (const [k,v] of Object.entries(params || {})) u.searchParams.set(k, String(v));
-  u.searchParams.set('login', env.STREAMTAPE_LOGIN);
-  u.searchParams.set('key', env.STREAMTAPE_KEY);
+  if (auth) {
+    if (!env.STREAMTAPE_LOGIN || !env.STREAMTAPE_KEY) throw new Error('STREAMTAPE_LOGIN dan STREAMTAPE_KEY belum dikonfigurasi.');
+    u.searchParams.set('login', env.STREAMTAPE_LOGIN);
+    u.searchParams.set('key', env.STREAMTAPE_KEY);
+  }
   const r = await fetch(u.toString(), {headers:{'accept':'application/json'}});
   const data = await r.json().catch(() => null);
   if (!r.ok || !data || Number(data.status) !== 200) {
@@ -463,11 +465,15 @@ async function streamtapeApi(path, params, env) {
 async function streamtapeRedirect(request, env, fileId) {
   if (!/^[A-Za-z0-9_-]{6,80}$/.test(fileId)) return json({ok:false,error:'File ID tidak valid.'},400);
   try {
-    const ticketData = await streamtapeApi('/file/dlticket', {file:fileId}, env);
+    // Streamtape mendokumentasikan login/key sebagai opsional untuk dlticket.
+    // Gunakan request tanpa kredensial terlebih dahulu agar Secret tidak ikut
+    // dikirim pada endpoint ticket; autentikasi tetap dipakai untuk file/info.
+    const ticketData = await streamtapeApi('/file/dlticket', {file:fileId}, env, {auth:false});
     if (!ticketData?.ticket) return json({ok:false,error:'Streamtape tidak memberikan download ticket.'},502);
     const wait = Math.max(0, Math.min(15, Number(ticketData.wait_time) || 0));
     if (wait) await new Promise(resolve => setTimeout(resolve, wait * 1000));
-    const download = await streamtapeApi('/file/dl', {file:fileId, ticket:ticketData.ticket}, env);
+    // Endpoint /file/dl hanya membutuhkan file + ticket; jangan kirim API Secret.
+    const download = await streamtapeApi('/file/dl', {file:fileId, ticket:ticketData.ticket}, env, {auth:false});
     const target = String(download?.url || '');
     let targetUrl;
     try { targetUrl = new URL(target); } catch { return json({ok:false,error:'URL streaming dari Streamtape tidak valid.'},502); }

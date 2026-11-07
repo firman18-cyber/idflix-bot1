@@ -417,6 +417,7 @@ function videoSourceKeyboard(mode) {
   return {inline_keyboard:[
     [{text:"🔗 Link Video / pihak ketiga", callback_data:`source:link:${mode}`}],
     [{text:"🎥 Upload Video (Teleplay)", callback_data:`source:upload:${mode}`}],
+    [{text:"🛸 UFOLOAD (ID / link player)", callback_data:`source:ufoload:${mode}`}],
     [{text:"❌ Batal", callback_data:"cancel"}]
   ]};
 }
@@ -658,7 +659,7 @@ function movieVideoEntries(m) {
 function videoLines(entries, indent) {
   if (!entries.length) return `${indent}(belum ada video)`;
   return entries
-    .map(([q, v]) => `${indent}${q}${v?.subtitle ? " 📄" : ""}: ${v?.videoUrl || "(link kosong)"}`)
+    .map(([q, v]) => `${indent}${q}${v?.subtitle ? " 📄" : ""}: ${v?.videoUrl || (v?.ufoloadId ? `ufoload:${v.ufoloadId}` : "(link kosong)")}`)
     .join("\n");
 }
 
@@ -767,7 +768,7 @@ async function setEpisodeNumber(env, state, n) {
   state.existingQualities = found ? Object.keys(found.videos) : [];
   state.epId = found ? found.id : episodeId(state.season, n);
   state.epTitle = found ? found.title : undefined;
-  for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "quality", "duration"]) delete state[k];
+  for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "ufoloadId", "quality", "duration"]) delete state[k];
   state.step = "await_source";
 }
 
@@ -788,6 +789,10 @@ ${pendingItems(s).length ? itemLines(pendingItems(s)) : s.videoUrl}
 }
 
 async function askNext(env, state, chatId) {
+  if (state.sourceType === "ufoload" && !state.ufoloadId && ["simpan", "eps", "tambah"].includes(state.mode)) {
+    await sendMessage(env, chatId, "🛸 Tempel link player UFOLOAD atau ID file (11 atau 26 karakter). Bot akan memastikan file sudah ready.");
+    return;
+  }
   if (state.mode === "simpan") {
     if (state.sourceType === "link" && !state.videoUrl) {
       await sendMessage(env, chatId, "🔗 Kirim link video (harus diawali https://, boleh dari hosting mana saja).");
@@ -916,7 +921,7 @@ async function askNext(env, state, chatId) {
       await sendMessage(env, chatId, qualityPromptText(state), {reply_markup:qualityKeyboard("", markedQualities(state))});
       return;
     }
-    const addItems = pendingItems(state).length ? pendingItems(state) : [{quality: state.quality, videoUrl: state.videoUrl}];
+    const addItems = pendingItems(state).length ? pendingItems(state) : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider, ufoloadId: state.ufoloadId}];
     const overlap = addItems.filter(i => state.existingQualities?.includes(i.quality)).map(i => i.quality);
     const overwriteAdd = overlap.length > 0;
     await sendMessage(env, chatId,
@@ -1322,6 +1327,8 @@ async function handleAdminText(msg, env, request) {
       }
       state.videoUrl = text;
       state.step = "await_quality";
+    } else if (state.sourceType === "ufoload" && state.step === "await_ufoload_id" && !state.ufoloadId) {
+      if (!(await acceptUfoloadInput(env, state, text, chatId))) return;
     } else if (!state.existing && state.quality && state.duration === undefined) {
       state.duration = text.slice(0, 30);
     } else {
@@ -1353,6 +1360,16 @@ async function handleAdminText(msg, env, request) {
     }
     state.videoUrl = text;
     state.step = "await_quality";
+    await putState(env, userId, state);
+    await askNext(env, state, chatId);
+    return;
+  }
+
+  if ((state.mode === "simpan" || state.mode === "tambah") &&
+      state.sourceType === "ufoload" &&
+      state.step === "await_ufoload_id" &&
+      !state.ufoloadId) {
+    if (!(await acceptUfoloadInput(env, state, text, chatId))) return;
     await putState(env, userId, state);
     await askNext(env, state, chatId);
     return;
@@ -1419,21 +1436,24 @@ async function handleCallback(q, env) {
       return answerCallback(env, q.id, "Sesi sumber video tidak valid.");
     }
 
-    if (sourceType !== "link" && sourceType !== "upload") {
+    if (sourceType !== "link" && sourceType !== "upload" && sourceType !== "ufoload") {
       return answerCallback(env, q.id, "Sumber video tidak valid.");
     }
 
     state.sourceType = sourceType;
-    state.step = sourceType === "upload" ? "await_video_upload" : "await_video_url";
+    state.step = sourceType === "upload" ? "await_video_upload" : (sourceType === "ufoload" ? "await_ufoload_id" : "await_video_url");
+    delete state.ufoloadId;
     delete state.videoUrl;
     delete state.videoMessageId;
     delete state.videoProvider;
     delete state.quality;
     await putState(env, userId, state);
-    await answerCallback(env, q.id, sourceType === "upload" ? "Upload Video dipilih" : "Link Video dipilih");
+    await answerCallback(env, q.id, sourceType === "upload" ? "Upload Video dipilih" : (sourceType === "ufoload" ? "UFOLOAD dipilih" : "Link Video dipilih"));
     await editMessage(env, chatId, msg.message_id,
       sourceType === "upload"
         ? "🎥 Upload Video dipilih.\n\nKirim video Telegram sekarang."
+        : sourceType === "ufoload"
+        ? "🛸 UFOLOAD dipilih.\n\nTempel link player atau ID file (11 atau 26 karakter)."
         : (state.mode === "simpan"
           ? "🔗 Link Video dipilih.\n\nKirim URL video (harus diawali https://)."
           : state.mode === "eps"
@@ -1480,9 +1500,9 @@ async function handleCallback(q, env) {
     if (state.mode === "simpan" || state.mode === "tambah") {
       // Kumpulkan resolusi ini, lalu tawarkan menambah resolusi lain sebelum menyimpan.
       const items = pendingItems(state).filter(i => i.quality !== state.quality);
-      items.push({quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"});
+      items.push({quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ufoloadId: state.ufoloadId});
       state.items = items;
-      for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "quality"]) delete state[k];
+      for (const k of ["sourceType", "videoUrl", "videoMessageId", "videoProvider", "ufoloadId", "quality"]) delete state[k];
       state.step = "after_resolution";
       await putState(env, userId, state);
       await answerCallback(env, q.id, "Resolusi ditambahkan");
@@ -1515,6 +1535,7 @@ async function handleCallback(q, env) {
     state.videoUrl = first.videoUrl;
     state.quality = first.quality;
     state.videoProvider = first.provider;
+    if (first.ufoloadId) state.ufoloadId = first.ufoloadId; else delete state.ufoloadId;
     state.step = "after_resolutions";
     await putState(env, userId, state);
     await answerCallback(env, q.id, "Lanjut");
@@ -1617,13 +1638,18 @@ async function handleCallback(q, env) {
     if (!movie) return answerCallback(env, q.id, "Series tidak ditemukan.");
     const found = episodeList(movie).find(e => e.season === state.season && e.number === state.number);
     const epId = found ? found.id : episodeId(state.season, state.number);
-    const video = {videoUrl: state.videoUrl, provider: state.videoProvider || "custom"};
+    const video = buildVideoRecord({videoUrl: state.videoUrl, provider: state.videoProvider, ufoloadId: state.ufoloadId});
     const label = `Musim ${state.season} Eps ${state.number}`;
 
     const overwrite = !!(found && found.videos[state.quality]);
     if (found) {
-      // PATCH hanya videoUrl+provider: subtitle yang sudah menempel di kualitas ini tetap ada.
-      await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${epId}/videos/${state.quality}`, video);
+      // PATCH hanya field sumber: subtitle yang sudah menempel di kualitas ini tetap ada.
+      // null menghapus sisa field sumber lama di Firebase (mis. videoUrl lama saat pindah ke UFOLOAD).
+      const prev = found.videos[state.quality];
+      const patchVideo = {...video};
+      if (video.provider === "ufoload") Object.assign(patchVideo, {videoUrl: null, url: null, telegramFileId: null, fileId: null});
+      else if (prev?.provider === "ufoload") Object.assign(patchVideo, {ufoloadId: null, format: null});
+      await firebaseRequest(env, "PATCH", `movies/${state.movieId}/episodes/${epId}/videos/${state.quality}`, patchVideo);
     } else {
       const ep = {season: state.season, number: state.number, videos: {[state.quality]: video}, addedAt: Date.now()};
       if (state.epTitle) ep.title = state.epTitle;
@@ -1763,9 +1789,9 @@ async function handleCallback(q, env) {
     await answerCallback(env, q.id, "Menyimpan film...");
     const items = pendingItems(state).length
       ? pendingItems(state)
-      : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}];
+      : [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ufoloadId: state.ufoloadId}];
     const videosMap = {};
-    for (const it of items) videosMap[it.quality] = {videoUrl: it.videoUrl, provider: it.provider || "custom"};
+    for (const it of items) videosMap[it.quality] = buildVideoRecord(it);
     const id = await uniqueMovieId(env, state.title);
     const movie = {
       type: "movie",
@@ -1778,10 +1804,11 @@ async function handleCallback(q, env) {
       posterFileId: state.posterFileId || "",
       backdrop: "",
       videos: videosMap,
-      videoUrl: items[0].videoUrl,
       quality: items[0].quality,
       addedAt: Date.now()
     };
+    // Root videoUrl hanya untuk link biasa; UFOLOAD tidak menyimpan URL apa pun.
+    if (!isUfoItem(items[0])) movie.videoUrl = items[0].videoUrl;
     await firebaseRequest(env, "PUT", `movies/${id}`, movie);
     await delState(env, userId);
 
@@ -1841,7 +1868,7 @@ async function handleCallback(q, env) {
   if (data === "confirm_add") {
     const items = pendingItems(state).length
       ? pendingItems(state)
-      : (state.videoUrl && state.quality ? [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom"}] : []);
+      : (state.videoUrl && state.quality ? [{quality: state.quality, videoUrl: state.videoUrl, provider: state.videoProvider || "custom", ufoloadId: state.ufoloadId}] : []);
     if (!state.movieId || !items.length) return answerCallback(env, q.id, "Data belum lengkap.");
     const movie = await getMovie(env, state.movieId);
     if (!movie) return answerCallback(env, q.id, "Film tidak ditemukan.");
@@ -1851,15 +1878,19 @@ async function handleCallback(q, env) {
     let rootUrl = movie.videoUrl || "";
     for (const it of items) {
       const old = videos[it.quality];
-      // Spread data lama supaya subtitle tidak hilang; hanya link & provider yang diganti.
-      videos[it.quality] = {...(old || {}), videoUrl: it.videoUrl, provider: it.provider || "custom"};
+      const itUrl = isUfoItem(it) ? "" : it.videoUrl;
+      // Spread data lama supaya subtitle tidak hilang; hanya field sumber video yang diganti.
+      const base = {...(old || {})};
+      if (isUfoItem(it)) { delete base.videoUrl; delete base.url; delete base.telegramFileId; delete base.fileId; }
+      else if (old?.provider === "ufoload") { delete base.ufoloadId; delete base.format; }
+      videos[it.quality] = {...base, ...buildVideoRecord(it)};
       if (old) {
-        overwritten.push({...it, oldUrl: old.videoUrl || "-"});
+        overwritten.push({...it, oldUrl: old.videoUrl || (old.ufoloadId ? `ufoload:${old.ufoloadId}` : "-")});
         // videoUrl utama ikut diganti jika itu memang link kualitas yang ditimpa.
-        if (movie.quality === it.quality || movie.videoUrl === old.videoUrl) rootUrl = it.videoUrl;
+        if (itUrl && (movie.quality === it.quality || movie.videoUrl === old.videoUrl)) rootUrl = itUrl;
       } else {
         added.push(it);
-        if (!rootUrl) rootUrl = it.videoUrl;
+        if (!rootUrl && itUrl) rootUrl = itUrl;
       }
     }
     const patch = {videos};
@@ -2356,12 +2387,164 @@ async function handleUfoloadTest(request, env, url) {
 }
 // ===================== akhir blok UFOLOAD TEST =====================
 
+// ===================== UFOLOAD PRODUKSI (Fase 2) =====================
+// ID publik UFOLOAD: 11 atau 26 karakter alfanumerik.
+const UFO_PUBLIC_ID_RE = /^(?:[A-Za-z0-9]{11}|[A-Za-z0-9]{26})$/;
+
+// Ambil ID dari ID polos atau link player (mis. .../e/<id>, .../v/<id>).
+function parseUfoloadId(input) {
+  const s = String(input || "").trim();
+  if (!s) return "";
+  if (UFO_PUBLIC_ID_RE.test(s)) return s;
+  let u;
+  try { u = new URL(s); } catch { return ""; }
+  if (u.protocol !== "https:") return "";
+  const segs = u.pathname.split("/").filter(Boolean).reverse();
+  for (const seg of segs) if (UFO_PUBLIC_ID_RE.test(seg)) return seg;
+  return "";
+}
+
+const isUfoItem = it => it?.provider === "ufoload" && UFO_PUBLIC_ID_RE.test(String(it.ufoloadId || ""));
+
+// Rekaman video untuk Firebase. UFOLOAD hanya menyimpan ID (tanpa URL bertanda tangan).
+function buildVideoRecord(it) {
+  return isUfoItem(it)
+    ? {provider: "ufoload", ufoloadId: it.ufoloadId, format: "hls"}
+    : {videoUrl: it.videoUrl, provider: it.provider || "custom"};
+}
+
+const ufoFileStatus = d => String(d?.status ?? d?.file?.status ?? "").toLowerCase();
+
+// Periksa file di UFOLOAD: "ready" | "processing" | "missing" | "error".
+async function ufoCheckFile(env, id) {
+  if (!env.UFOLOAD_API_KEY) return {state: "error", reason: "UFOLOAD_API_KEY belum diatur"};
+  const r = await ufoCall(env, "GET", `/files/${id}`, {timeoutMs: 12000});
+  if (!r.ok) return r.status === 404 ? {state: "missing"} : {state: "error", status: r.status, reason: r.error};
+  const st = ufoFileStatus(r.data);
+  if (st === "ready") return {state: "ready"};
+  if (st === "processing" || st === "queued" || st === "pending" || st === "uploading") return {state: "processing"};
+  return {state: "error", reason: `status file: ${st || "tidak diketahui"}`};
+}
+
+// Bot: terima ID/link dari admin, validasi ready, isi state. Mengembalikan true bila diterima.
+async function acceptUfoloadInput(env, state, text, chatId) {
+  const id = parseUfoloadId(text);
+  if (!id) {
+    await sendMessage(env, chatId, "❌ ID tidak dikenali. Tempel link player UFOLOAD atau ID (11 atau 26 karakter huruf/angka).");
+    return false;
+  }
+  const c = await ufoCheckFile(env, id);
+  if (c.state === "missing") { await sendMessage(env, chatId, "❌ File tidak ditemukan di UFOLOAD. Periksa ID-nya."); return false; }
+  if (c.state === "processing") { await sendMessage(env, chatId, "⏳ File masih diproses UFOLOAD. Coba kirim lagi nanti sampai statusnya ready."); return false; }
+  if (c.state !== "ready") { await sendMessage(env, chatId, `❌ Tidak bisa memeriksa file UFOLOAD (${String(c.reason || "error").slice(0, 120)}).`); return false; }
+  state.ufoloadId = id;
+  state.videoProvider = "ufoload";
+  state.videoUrl = `ufoload:${id}`; // hanya penanda di state/ringkasan; tidak ditulis ke Firebase
+  state.step = "await_quality";
+  return true;
+}
+
+// ---- Endpoint publik: GET /ufoload/play/<filmId>/<quality>[/<episodeId>] ----
+const UFO_EMBED_BASE = "https://iframe.andromedans.live/e/";
+const ufoRlMem = new Map(); // cadangan per-isolate bila binding UFOLOAD_RL tidak ada
+
+function ufoPlayOrigins(env) {
+  const l = String(env.UFOLOAD_PLAY_ORIGINS || "https://idflixfilm.pages.dev").split(",").map(x => x.trim()).filter(Boolean);
+  return l;
+}
+
+function ufoPlayCors(origin, env) {
+  if (!origin || !ufoPlayOrigins(env).includes(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Max-Age": "600"
+  };
+}
+
+function ufoPlayJson(data, status, cors) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {"content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...cors}
+  });
+}
+
+async function ufoRateOk(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  if (env.UFOLOAD_RL && typeof env.UFOLOAD_RL.limit === "function") {
+    try { return (await env.UFOLOAD_RL.limit({key: ip})).success; } catch { return true; }
+  }
+  const now = Date.now(), win = 60000, max = Number(env.UFOLOAD_PLAY_RPM || 30);
+  const e = ufoRlMem.get(ip);
+  if (!e || now - e.t > win) {
+    if (ufoRlMem.size > 5000) ufoRlMem.clear();
+    ufoRlMem.set(ip, {t: now, n: 1});
+    return true;
+  }
+  e.n++;
+  return e.n <= max;
+}
+
+async function handleUfoloadPlay(request, env) {
+  const url = new URL(request.url);
+  const origin = request.headers.get("Origin") || "";
+  const cors = ufoPlayCors(origin, env);
+  if (request.method === "OPTIONS") return new Response(null, {status: 204, headers: cors});
+  if (request.method !== "GET") return ufoPlayJson({ok: false, code: "method"}, 405, cors);
+  // Origin yang dikirim tapi bukan origin IDFLIX ditolak.
+  if (origin && !cors["Access-Control-Allow-Origin"]) return ufoPlayJson({ok: false, code: "forbidden"}, 403, {});
+  if (!(await ufoRateOk(request, env))) return ufoPlayJson({ok: false, code: "rate_limited"}, 429, cors);
+
+  const parts = url.pathname.split("/").filter(Boolean).slice(2); // setelah /ufoload/play
+  const [filmId, quality, epId] = parts.map(x => { try { return decodeURIComponent(x); } catch { return ""; } });
+  const SAFE = /^[A-Za-z0-9_-]{1,120}$/;
+  if (parts.length < 2 || parts.length > 3 || !SAFE.test(filmId || "") || !QUALITIES.includes(quality) || (epId !== undefined && !SAFE.test(epId))) {
+    return ufoPlayJson({ok: false, code: "bad_request"}, 400, cors);
+  }
+
+  try {
+    const path = epId ? `movies/${filmId}/episodes/${epId}/videos/${quality}` : `movies/${filmId}/videos/${quality}`;
+    const rec = await firebaseRequest(env, "GET", path);
+    if (!rec || rec.provider !== "ufoload" || !UFO_PUBLIC_ID_RE.test(String(rec.ufoloadId || ""))) {
+      return ufoPlayJson({ok: false, code: "not_ufoload"}, 404, cors);
+    }
+    const id = rec.ufoloadId;
+    const chk = await ufoCheckFile(env, id);
+    if (chk.state === "missing") return ufoPlayJson({ok: false, code: "gone"}, 404, cors);
+    if (chk.state === "processing") return ufoPlayJson({ok: false, code: "processing", message: "Video sedang diproses"}, 202, cors);
+    if (chk.state !== "ready") return ufoPlayJson({ok: false, code: "unavailable"}, 503, cors);
+
+    if (String(env.UFOLOAD_PLAY_MODE || "embed").toLowerCase() !== "hls") {
+      return ufoPlayJson({ok: true, mode: "embed", url: UFO_EMBED_BASE + id}, 200, cors);
+    }
+    // Mode HLS: link bertanda tangan TTL 4–6 jam (default 5 jam). Tanpa bind_ip (IP seluler bisa berganti).
+    const ttl = Math.min(Math.max(Math.floor(Number(env.UFOLOAD_LINK_TTL)) || 18000, 14400), 21600);
+    const l = await ufoCall(env, "POST", `/files/${id}/links`, {json: {ttl}, timeoutMs: 12000});
+    if (!l.ok) {
+      if (l.status === 404) return ufoPlayJson({ok: false, code: "gone"}, 404, cors);
+      return ufoPlayJson({ok: false, code: "unavailable"}, 503, cors);
+    }
+    // Kunci ada di level atas respons (hasil Fase 1); links.* sebagai cadangan.
+    const playback = l.data?.playback || l.data?.links?.playback;
+    const expiresAt = l.data?.expires_at || l.data?.links?.expires_at || null;
+    if (!playback) return ufoPlayJson({ok: false, code: "unavailable"}, 503, cors);
+    return ufoPlayJson({ok: true, mode: "hls", url: playback, expiresAt}, 200, cors);
+  } catch {
+    return ufoPlayJson({ok: false, code: "unavailable"}, 503, cors); // tanpa detail, tanpa log link
+  }
+}
+// ===================== akhir blok UFOLOAD PRODUKSI =====================
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // Endpoint pengujian UFOLOAD (admin-only, nonaktif default). Tidak memengaruhi route lain.
     if (url.pathname.startsWith("/admin/ufoload/")) return handleUfoloadTest(request, env, url);
+
+    // Endpoint publik pemutaran UFOLOAD (CORS ketat, rate limit). Tidak memengaruhi route lain.
+    if (url.pathname.startsWith("/ufoload/play/")) return handleUfoloadPlay(request, env);
 
     if (request.method === "OPTIONS") {
       return new Response(null, {

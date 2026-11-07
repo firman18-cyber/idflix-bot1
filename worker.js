@@ -2091,7 +2091,9 @@ async function diagnostic(env) {
     TELEGRAM_CHAT_ID: !!env.TELEGRAM_CHAT_ID,
     TOPIC_KV: !!env.TOPIC_KV,
     FIREBASE_CLIENT_EMAIL: !!env.FIREBASE_CLIENT_EMAIL,
-    FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY
+    FIREBASE_PRIVATE_KEY: !!env.FIREBASE_PRIVATE_KEY,
+    UFOLOAD_API_KEY: !!env.UFOLOAD_API_KEY,
+    UFOLOAD_TEST_ENABLED: String(env.UFOLOAD_TEST_ENABLED||"")==="1"
   };
 
   let webhook;
@@ -2108,9 +2110,258 @@ async function diagnostic(env) {
   return {ok:true, env: envInfo, webhook};
 }
 
+// =====================================================================
+// UFOLOAD TEST (admin-only, terisolasi) — hanya untuk tahap pengujian.
+// Nonaktif secara default: aktif hanya jika secret UFOLOAD_TEST_ENABLED = "1".
+// Wajib: UFOLOAD_API_KEY (secret) + UFOLOAD_ADMIN_TOKEN (secret, token admin).
+// Opsional: UFOLOAD_TEST_ORIGINS (daftar origin yang boleh memanggil, pisah koma),
+//           UFOLOAD_TEST_MAX_BYTES (batas upload uji, default 50 MB).
+// Tidak menyentuh Firebase, Telegram, player produksi, maupun provider lain.
+// =====================================================================
+const UFO_BASE = "https://ufoload.com/api/v1";
+const UFO_TTL_MIN = 60;
+const UFO_TTL_MAX = 30 * 86400;
+const UFO_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
+
+function ufoRedact(s) {
+  return String(s ?? "")
+    .replace(/ufo_[A-Za-z0-9_\-]{6,}/g, "ufo_***")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/=\-]+/gi, "Bearer ***")
+    .replace(/([?&](?:token|sig|signature|expires|exp|key|hmac|st|e)=)[^&"'\s]+/gi, "$1***");
+}
+
+function ufoCors(request, env) {
+  const origin = request.headers.get("Origin") || "";
+  const allowed = String(env.UFOLOAD_TEST_ORIGINS || "").split(",").map(x => x.trim()).filter(Boolean);
+  if (!origin || !allowed.includes(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-File-Name"
+  };
+}
+
+function ufoJson(data, status, cors) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {"content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...cors}
+  });
+}
+
+async function ufoSha256(s) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+}
+
+async function ufoAuthOk(request, env) {
+  const token = String(env.UFOLOAD_ADMIN_TOKEN || "");
+  if (token.length < 16) return false; // token lemah/kosong ditolak
+  const m = /^Bearer\s+(.+)$/i.exec(request.headers.get("Authorization") || "");
+  if (!m) return false;
+  const [a, b] = await Promise.all([ufoSha256(m[1].trim()), ufoSha256(token)]);
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+function ufoErrorFor(status) {
+  if (status === 401) return "UFOLOAD menolak API key (401: key salah/tidak ada)";
+  if (status === 403) return "UFOLOAD menolak izin (403)";
+  if (status === 404) return "Tidak ditemukan (404)";
+  if (status === 409) return "Penyimpanan UFOLOAD tidak cukup (409)";
+  if (status === 413) return "File terlalu besar untuk plan (413)";
+  if (status === 429) return "Rate limit UFOLOAD (429)";
+  return `Error dari UFOLOAD (${status})`;
+}
+
+// Memanggil API UFOLOAD. Authorization tidak pernah dicatat/dikembalikan.
+async function ufoCall(env, method, path, {json, headers = {}, body, badKey = false, timeoutMs = 25000} = {}) {
+  const h = {"Authorization": `Bearer ${badKey ? "ufo_invalid_key_for_test" : env.UFOLOAD_API_KEY}`, ...headers};
+  let payload = body;
+  if (json !== undefined) { h["Content-Type"] = "application/json"; payload = JSON.stringify(json); }
+  const init = {method, headers: h, body: payload};
+  if (body && typeof body === "object" && "getReader" in body) init.duplex = "half";
+  if (timeoutMs) init.signal = AbortSignal.timeout(timeoutMs);
+  let res;
+  try { res = await fetch(UFO_BASE + path, init); }
+  catch (e) { return {ok: false, status: 0, error: "Gagal menghubungi UFOLOAD", detail: ufoRedact(e?.name === "TimeoutError" ? "timeout" : e?.message).slice(0, 200)}; }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok) {
+    return {
+      ok: false, status: res.status, error: ufoErrorFor(res.status),
+      retry_after: res.headers.get("Retry-After") || undefined,
+      detail: ufoRedact(data ? JSON.stringify(data) : text).slice(0, 400)
+    };
+  }
+  return {ok: true, status: res.status, data};
+}
+
+function ufoSafeUrl(u) {
+  let x;
+  try { x = new URL(u); } catch { return null; }
+  if (x.protocol !== "https:") return null;
+  const h = x.hostname.toLowerCase();
+  if (h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") || h.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return null;
+  return x;
+}
+
+const ufoStrip = u => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return "?"; } };
+
+// Probe sisi server: master playlist -> media playlist -> 1 segmen. URL bertanda tangan
+// tidak pernah dikembalikan (query dibuang) agar laporan aman dibagikan.
+async function ufoProbe(playlistUrl, origin) {
+  const steps = [];
+  const get = async (name, u, extra = {}) => {
+    const safe = ufoSafeUrl(u);
+    if (!safe) { steps.push({step: name, ok: false, error: "URL ditolak (harus https & host publik)"}); return null; }
+    const t0 = Date.now();
+    try {
+      const headers = {...(origin ? {"Origin": origin} : {}), ...(extra.headers || {})};
+      const r = await fetch(safe.toString(), {headers, signal: AbortSignal.timeout(20000)});
+      const info = {
+        step: name, url: ufoStrip(u), status: r.status, ok: r.ok,
+        content_type: r.headers.get("content-type") || null,
+        content_length: r.headers.get("content-length") || null,
+        acao: r.headers.get("access-control-allow-origin") || null,
+        ms: Date.now() - t0
+      };
+      steps.push(info);
+      return {r, info};
+    } catch (e) {
+      steps.push({step: name, url: ufoStrip(u), ok: false, error: ufoRedact(e?.message).slice(0, 160)});
+      return null;
+    }
+  };
+
+  const m = await get("master_playlist", playlistUrl);
+  if (!m || !m.r.ok) return {steps};
+  const masterText = await m.r.text();
+  const ml = masterText.split(/\r?\n/);
+  m.info.is_m3u8 = ml[0]?.trim() === "#EXTM3U";
+  m.info.variants = ml.filter(l => l.startsWith("#EXT-X-STREAM-INF")).length;
+  m.info.resolutions = ml.map(l => /RESOLUTION=(\d+x\d+)/.exec(l)?.[1]).filter(Boolean);
+  const variantUri = ml.find((l, i) => l && !l.startsWith("#") && ml[i - 1]?.startsWith("#EXT-X-STREAM-INF"));
+  if (!variantUri) return {steps};
+
+  const v = await get("media_playlist", new URL(variantUri, playlistUrl).toString());
+  if (!v || !v.r.ok) return {steps};
+  const vText = await v.r.text();
+  const vl = vText.split(/\r?\n/);
+  v.info.segments = vl.filter(l => l.startsWith("#EXTINF")).length;
+  v.info.has_endlist = vText.includes("#EXT-X-ENDLIST");
+  const segUri = vl.find(l => l && !l.startsWith("#"));
+  if (!segUri) return {steps};
+
+  const s = await get("first_segment", new URL(segUri, new URL(variantUri, playlistUrl)).toString(), {headers: {"Range": "bytes=0-1023"}});
+  if (s) { try { await s.r.body?.cancel(); } catch {} }
+  return {steps};
+}
+
+async function handleUfoloadTest(request, env, url) {
+  // Fitur dimatikan => seolah tidak ada.
+  if (String(env.UFOLOAD_TEST_ENABLED || "") !== "1") return new Response("Not Found", {status: 404});
+  const cors = ufoCors(request, env);
+  if (request.method === "OPTIONS") {
+    return new Response(null, {status: 204, headers: {...cors, "Access-Control-Max-Age": "600"}});
+  }
+  if (!(await ufoAuthOk(request, env))) return ufoJson({ok: false, error: "unauthorized"}, 401, cors);
+  if (!env.UFOLOAD_API_KEY) return ufoJson({ok: false, error: "UFOLOAD_API_KEY belum diatur"}, 500, cors);
+
+  const parts = url.pathname.split("/").filter(Boolean).slice(2); // setelah /admin/ufoload
+  const route = parts[0] || "";
+  const id = parts[1] || "";
+  const out = (r, extra = {}) => ufoJson(r.ok ? {ok: true, upstream_status: r.status, ...extra, data: r.data} : {ok: false, upstream_status: r.status, error: r.error, retry_after: r.retry_after, detail: r.detail}, r.ok ? 200 : (r.status >= 400 && r.status < 500 ? r.status : 502), cors);
+
+  try {
+    // GET /ping[?badkey=1]  -> cek autentikasi API (badkey=1 sengaja memakai key salah untuk uji 401)
+    if (route === "ping" && request.method === "GET") {
+      return out(await ufoCall(env, "GET", "/files/stats", {badKey: url.searchParams.get("badkey") === "1"}));
+    }
+    // GET /list?status=ready&limit=20
+    if (route === "list" && request.method === "GET") {
+      const q = new URLSearchParams();
+      const st = url.searchParams.get("status");
+      if (st && /^[a-z]{3,12}$/.test(st)) q.set("status", st);
+      q.set("limit", String(Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50)));
+      return out(await ufoCall(env, "GET", `/files?${q}`));
+    }
+    // POST /upload  (raw body + X-File-Name, atau multipart) — dibatasi ukuran uji
+    if (route === "upload" && request.method === "POST") {
+      const ctype = request.headers.get("Content-Type") || "application/octet-stream";
+      const isMultipart = /multipart\/form-data/i.test(ctype);
+      const name = request.headers.get("X-File-Name") || "";
+      if (!isMultipart && (!name || name.length > 200 || !/^[\x20-\x7E]+$/.test(name))) {
+        return ufoJson({ok: false, error: "X-File-Name wajib (ASCII, maks 200 karakter)"}, 400, cors);
+      }
+      const len = Number(request.headers.get("Content-Length") || 0);
+      const max = Number(env.UFOLOAD_TEST_MAX_BYTES || 52428800);
+      if (!len) return ufoJson({ok: false, error: "Content-Length wajib"}, 411, cors);
+      if (len > max) return ufoJson({ok: false, error: `File uji melebihi batas ${max} byte`}, 413, cors);
+      const headers = {"Content-Type": ctype};
+      if (!isMultipart) headers["X-File-Name"] = name;
+      return out(await ufoCall(env, "POST", "/files", {headers, body: request.body, timeoutMs: 0}));
+    }
+    // POST /import {url,name}
+    if (route === "import" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      if (!ufoSafeUrl(b.url)) return ufoJson({ok: false, error: "url wajib https & host publik"}, 400, cors);
+      const payload = {url: String(b.url)};
+      if (b.name) payload.name = String(b.name).slice(0, 200);
+      return out(await ufoCall(env, "POST", "/files/import", {json: payload}));
+    }
+    // GET /imports  -> status import by URL
+    if (route === "imports" && request.method === "GET") {
+      return out(await ufoCall(env, "GET", "/files/import"));
+    }
+    // GET /file/<id>  -> status file (polling)
+    if (route === "file" && request.method === "GET") {
+      if (!UFO_ID_RE.test(id)) return ufoJson({ok: false, error: "id tidak valid"}, 400, cors);
+      return out(await ufoCall(env, "GET", `/files/${id}`));
+    }
+    // DELETE /file/<id>  -> hapus file uji
+    if (route === "file" && request.method === "DELETE") {
+      if (!UFO_ID_RE.test(id)) return ufoJson({ok: false, error: "id tidak valid"}, 400, cors);
+      return out(await ufoCall(env, "DELETE", `/files/${id}`));
+    }
+    // POST /link/<id> {ttl,bind_ip,bind_cookie}  -> signed link baru (tidak disimpan)
+    if (route === "link" && request.method === "POST") {
+      if (!UFO_ID_RE.test(id)) return ufoJson({ok: false, error: "id tidak valid"}, 400, cors);
+      const b = await request.json().catch(() => ({}));
+      const body = {ttl: Math.min(Math.max(Math.floor(Number(b.ttl)) || 300, UFO_TTL_MIN), UFO_TTL_MAX)};
+      if (b.bind_ip !== undefined) body.bind_ip = b.bind_ip;
+      if (b.bind_cookie !== undefined) body.bind_cookie = b.bind_cookie;
+      return out(await ufoCall(env, "POST", `/files/${id}/links`, {json: body}), {ttl: body.ttl});
+    }
+    // POST /probe {fileId, ttl} atau {url}  -> uji manifest + segmen + header CORS dari sisi server
+    if (route === "probe" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const origin = String(b.origin || "").slice(0, 200);
+      let playlist = b.url;
+      if (!playlist) {
+        if (!UFO_ID_RE.test(String(b.fileId || ""))) return ufoJson({ok: false, error: "fileId atau url wajib"}, 400, cors);
+        const ttl = Math.min(Math.max(Math.floor(Number(b.ttl)) || 120, UFO_TTL_MIN), UFO_TTL_MAX);
+        const l = await ufoCall(env, "POST", `/files/${b.fileId}/links`, {json: {ttl}});
+        if (!l.ok) return out(l);
+        playlist = l.data?.links?.playback || l.data?.playback;
+        if (!playlist) return ufoJson({ok: false, error: "Respons tidak memuat links.playback", keys: Object.keys(l.data || {})}, 502, cors);
+      }
+      return ufoJson({ok: true, ...(await ufoProbe(playlist, origin))}, 200, cors);
+    }
+    return ufoJson({ok: false, error: "not_found"}, 404, cors);
+  } catch (e) {
+    return ufoJson({ok: false, error: "internal_error", detail: ufoRedact(e?.message).slice(0, 200)}, 500, cors);
+  }
+}
+// ===================== akhir blok UFOLOAD TEST =====================
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // Endpoint pengujian UFOLOAD (admin-only, nonaktif default). Tidak memengaruhi route lain.
+    if (url.pathname.startsWith("/admin/ufoload/")) return handleUfoloadTest(request, env, url);
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
